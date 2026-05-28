@@ -13,7 +13,7 @@ use crate::error::AppError;
 /// - `dirs::home_dir()` 在 Windows 上使用 `SHGetKnownFolderPath(FOLDERID_Profile)`，
 ///   返回的是真实用户目录（类似 `C:\\Users\\Alice`），与 v3.10.2 行为一致。
 /// - 不要直接使用 `HOME` 环境变量：它可能由 Git/Cygwin/MSYS 等第三方工具注入，
-///   且不一定等于用户目录，可能导致 `.cc-switch/cc-switch.db` 路径变化，从而“看起来像数据丢失”。
+///   且不一定等于用户目录，可能导致 `.cc-switch/cc-switch.db` 路径变化，从而"看起来像数据丢失"。
 ///
 /// ## 测试隔离
 ///
@@ -92,34 +92,55 @@ pub fn get_app_config_dir() -> PathBuf {
         return custom;
     }
 
-    let default_dir = get_home_dir().join(".cc-switch");
-
-    // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
-    // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
-    // 这里仅在“默认位置没有数据库”时回退到旧位置，避免再次出现“供应商消失”问题，
-    // 同时也避免新安装因为 `HOME` 被设置而写入非预期路径。
-    #[cfg(windows)]
+    // 开发模式：使用隔离目录，避免污染生产数据
+    #[cfg(debug_assertions)]
     {
-        let default_db = default_dir.join("cc-switch.db");
-        if !default_db.exists() {
-            if let Ok(home_env) = std::env::var("HOME") {
-                let trimmed = home_env.trim();
-                if !trimmed.is_empty() {
-                    let legacy_dir = PathBuf::from(trimmed).join(".cc-switch");
-                    if legacy_dir.join("cc-switch.db").exists() {
-                        log::info!(
-                            "Detected v3.10.3 legacy database at {}, using it instead of {}",
-                            legacy_dir.display(),
-                            default_dir.display()
-                        );
-                        return legacy_dir;
+        let dev_dir = get_home_dir().join(".cc-switch-dev");
+        if !dev_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&dev_dir) {
+                log::warn!(
+                    "[Dev] Failed to create dev config dir {}: {e}",
+                    dev_dir.display()
+                );
+            } else {
+                log::info!("[Dev] Created dev config dir: {}", dev_dir.display());
+            }
+        }
+        log::info!("[Dev] Using isolated config dir: {}", dev_dir.display());
+        return dev_dir;
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let default_dir = get_home_dir().join(".cc-switch");
+
+        // 兼容 v3.10.3：当用户环境存在 `HOME` 且与真实用户目录不同，
+        // v3.10.3 可能在 `HOME/.cc-switch/` 下创建/使用了数据库。
+        // 这里仅在"默认位置没有数据库"时回退到旧位置，避免再次出现"供应商消失"问题，
+        // 同时也避免新安装因为 `HOME` 被设置而写入非预期路径。
+        #[cfg(windows)]
+        {
+            let default_db = default_dir.join("cc-switch.db");
+            if !default_db.exists() {
+                if let Ok(home_env) = std::env::var("HOME") {
+                    let trimmed = home_env.trim();
+                    if !trimmed.is_empty() {
+                        let legacy_dir = PathBuf::from(trimmed).join(".cc-switch");
+                        if legacy_dir.join("cc-switch.db").exists() {
+                            log::info!(
+                                "Detected v3.10.3 legacy database at {}, using it instead of {}",
+                                legacy_dir.display(),
+                                default_dir.display()
+                            );
+                            return legacy_dir;
+                        }
                     }
                 }
             }
         }
-    }
 
-    default_dir
+        default_dir
+    }
 }
 
 /// 获取应用配置文件路径
