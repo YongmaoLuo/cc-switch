@@ -464,3 +464,32 @@ pub async fn get_provider_icon(
         svg_content,
     )
 }
+
+/// POST /api/proxy/stop — 停止代理服务器并恢复 Live 配置
+///
+/// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
+/// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
+pub async fn stop_proxy(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+) -> impl IntoResponse {
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    let app_state = app_state(&state);
+
+    match app_state.proxy_service.stop_with_restore().await {
+        Ok(()) => {
+            log::info!("[Remote] Proxy stopped and live configs restored via API");
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) => {
+            log::error!("[Remote] Failed to stop proxy via API: {e}");
+            Json(json!({"success": false, "error": e.to_string()})).into_response()
+        }
+    }
+}

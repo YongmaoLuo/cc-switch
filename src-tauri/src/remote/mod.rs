@@ -381,6 +381,10 @@ impl RemoteServer {
                 "/api/provider-icons/:name",
                 axum::routing::get(handlers::get_provider_icon),
             )
+            .route(
+                "/api/proxy/stop",
+                axum::routing::post(handlers::stop_proxy),
+            )
             .layer(cors)
             .with_state(self.state.clone())
     }
