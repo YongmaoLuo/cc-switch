@@ -385,6 +385,14 @@ impl RemoteServer {
                 "/api/proxy/stop",
                 axum::routing::post(handlers::stop_proxy),
             )
+            .route(
+                "/api/proxy/takeover",
+                axum::routing::post(handlers::proxy_takeover),
+            )
+            .route(
+                "/api/proxy/failover",
+                axum::routing::post(handlers::proxy_failover),
+            )
             .layer(cors)
             .with_state(self.state.clone())
     }

@@ -493,3 +493,193 @@ pub async fn stop_proxy(
         }
     }
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTakeoverRequest {
+    pub app_type: String,
+    pub enabled: bool,
+}
+
+/// POST /api/proxy/takeover — 为指定应用开启/关闭代理接管
+///
+/// Body: {"appType": "claude", "enabled": true}
+pub async fn proxy_takeover(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    Json(body): Json<ProxyTakeoverRequest>,
+) -> impl IntoResponse {
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    let app_state = app_state(&state);
+
+    match app_state
+        .proxy_service
+        .set_takeover_for_app(&body.app_type, body.enabled)
+        .await
+    {
+        Ok(()) => {
+            log::info!(
+                "[Remote] Proxy takeover for {} set to {} via API",
+                body.app_type,
+                body.enabled
+            );
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) => {
+            log::error!("[Remote] Failed to set proxy takeover via API: {e}");
+            Json(json!({"success": false, "error": e.to_string()})).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverToggleRequest {
+    pub app_type: String,
+    pub enabled: bool,
+}
+
+/// POST /api/proxy/failover — 开启/关闭指定应用的自动故障转移
+///
+/// Body: {"appType": "claude", "enabled": true}
+///
+/// 开启时会自动将故障转移队列的 P1 设为当前供应商。
+pub async fn proxy_failover(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    Json(body): Json<FailoverToggleRequest>,
+) -> impl IntoResponse {
+    use std::str::FromStr;
+    use tauri::Emitter;
+
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    let app_state = app_state(&state);
+    let app = &state.app_handle;
+
+    // 强一致语义：开启故障转移后立即切到队列 P1（并确保队列非空）
+    let p1_provider_id = if body.enabled {
+        let mut queue = match app_state.db.get_failover_queue(&body.app_type) {
+            Ok(q) => q,
+            Err(e) => {
+                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            }
+        };
+
+        if queue.is_empty() {
+            let app_enum = match crate::app_config::AppType::from_str(&body.app_type) {
+                Ok(a) => a,
+                Err(_) => {
+                    return Json(
+                        json!({"success": false, "error": format!("无效的应用类型: {}", body.app_type)}),
+                    )
+                    .into_response();
+                }
+            };
+
+            let current_id =
+                match crate::settings::get_effective_current_provider(&app_state.db, &app_enum) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                    }
+                };
+
+            let Some(current_id) = current_id else {
+                return Json(
+                    json!({"success": false, "error": "故障转移队列为空，且未设置当前供应商，无法开启故障转移"}),
+                )
+                .into_response();
+            };
+
+            if let Err(e) = app_state.db.add_to_failover_queue(&body.app_type, &current_id) {
+                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            }
+
+            queue = match app_state.db.get_failover_queue(&body.app_type) {
+                Ok(q) => q,
+                Err(e) => {
+                    return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                }
+            };
+        }
+
+        match queue.first() {
+            Some(item) => item.provider_id.clone(),
+            None => {
+                return Json(
+                    json!({"success": false, "error": "故障转移队列为空，无法开启故障转移"}),
+                )
+                .into_response();
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // 读取并更新 proxy_config
+    let mut config = match app_state.db.get_proxy_config_for_app(&body.app_type).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+    config.auto_failover_enabled = body.enabled;
+
+    if let Err(e) = app_state.db.update_proxy_config_for_app(config).await {
+        return Json(json!({"success": false, "error": e.to_string()})).into_response();
+    }
+
+    // 开启后立即切到 P1
+    if body.enabled {
+        if let Err(e) = app_state
+            .proxy_service
+            .switch_proxy_target(&body.app_type, &p1_provider_id)
+            .await
+        {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+
+        // 发射 provider-switched 事件
+        let event_data = serde_json::json!({
+            "appType": body.app_type,
+            "providerId": p1_provider_id,
+            "source": "failoverEnabled"
+        });
+        let _ = app.emit("provider-switched", event_data);
+
+        // 广播给远程浏览器（SSE）
+        let app_clone = app.clone();
+        let p1_id = p1_provider_id.clone();
+        let app_type = body.app_type.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::remote::broadcast_provider_switch(&app_clone, &app_type, &p1_id).await;
+        });
+    }
+
+    // 刷新托盘菜单
+    if let Ok(new_menu) = crate::tray::create_tray_menu(app, app_state.inner()) {
+        if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
+            let _ = tray.set_menu(Some(new_menu));
+        }
+    }
+
+    log::info!(
+        "[Remote] Auto failover for {} set to {} via API",
+        body.app_type,
+        body.enabled
+    );
+
+    Json(json!({"success": true})).into_response()
+}
