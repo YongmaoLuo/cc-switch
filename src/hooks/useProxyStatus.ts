@@ -34,6 +34,7 @@ export function useProxyStatus() {
   const { data: takeoverStatus } = useQuery({
     queryKey: ["proxyTakeoverStatus"],
     queryFn: () => invoke<ProxyTakeoverStatus>("get_proxy_takeover_status"),
+    refetchInterval: 2000,
     placeholderData: (previousData) => previousData,
   });
 
