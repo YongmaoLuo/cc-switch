@@ -27,7 +27,10 @@ pub struct SwitchRequest {
 
 #[derive(Deserialize)]
 pub struct ReorderRequest {
-    pub updates: Vec<ProviderSortUpdate>,
+    /// 被拖拽移动的 provider ID
+    pub moved_id: String,
+    /// 目标位置的 provider ID（移动到这个 provider 之前）
+    pub before_id: String,
 }
 
 fn app_state(state: &RemoteState) -> tauri::State<'_, AppState> {
@@ -207,6 +210,9 @@ pub async fn switch_provider(
 }
 
 /// POST /api/reorder
+///
+/// 模拟拖拽排序：将 moved_id 移动到 before_id 之前。
+/// 如果 before_id 为空，则移动到列表末尾。
 pub async fn reorder_providers(
     AxumState(state): AxumState<Arc<RemoteState>>,
     Json(body): Json<ReorderRequest>,
@@ -219,15 +225,81 @@ pub async fn reorder_providers(
             .into_response();
     }
 
-    if body.updates.is_empty() {
-        return Json(json!({"success": false, "error": "Empty updates"})).into_response();
+    if body.moved_id.is_empty() {
+        return Json(json!({"success": false, "error": "Missing moved_id"})).into_response();
     }
 
     let app_state = app_state(&state);
 
-    match ProviderService::update_sort_order(app_state.inner(), REMOTE_APP, body.updates) {
+    // 1. 获取当前完整 provider 列表
+    let providers = match ProviderService::list(app_state.inner(), REMOTE_APP) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+
+    // 2. 按 sort_index 排序（与前端 sortedProviders 一致）
+    let mut sorted: Vec<(&String, &crate::provider::Provider)> = providers.iter().collect();
+    sorted.sort_by(|(_, a), (_, b)| match (a.sort_index, b.sort_index) {
+        (Some(ai), Some(bi)) => ai.cmp(&bi),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    // 3. 找到 moved_id 和 before_id 的位置
+    let moved_idx = sorted
+        .iter()
+        .position(|(id, _)| id.as_str() == body.moved_id);
+    let before_idx = if body.before_id.is_empty() {
+        None // 移动到末尾
+    } else {
+        sorted
+            .iter()
+            .position(|(id, _)| id.as_str() == body.before_id)
+    };
+
+    let moved_idx = match moved_idx {
+        Some(idx) => idx,
+        None => {
+            return Json(
+                json!({"success": false, "error": format!("Provider '{}' not found", body.moved_id)}),
+            )
+            .into_response();
+        }
+    };
+
+    // 4. 模拟 arrayMove：移除 moved，插入到 before 之前
+    let item = sorted.remove(moved_idx);
+    let new_idx = match before_idx {
+        Some(idx) => {
+            let target = if idx > moved_idx { idx } else { idx };
+            target
+        }
+        None => sorted.len(), // 末尾
+    };
+    sorted.insert(new_idx, item);
+
+    // 5. 重新分配 sort_index
+    let updates: Vec<ProviderSortUpdate> = sorted
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (id, _))| ProviderSortUpdate {
+            id: id.clone(),
+            sort_index: idx,
+        })
+        .collect();
+
+    // 6. 保存
+    match ProviderService::update_sort_order(app_state.inner(), REMOTE_APP, updates) {
         Ok(_) => {
-            log::info!("[Remote] Reordered providers for {}", REMOTE_APP.as_str());
+            log::info!(
+                "[Remote] Moved provider '{}' to position {} in {}",
+                body.moved_id,
+                new_idx,
+                REMOTE_APP.as_str()
+            );
             Json(json!({"success": true})).into_response()
         }
         Err(e) => {
