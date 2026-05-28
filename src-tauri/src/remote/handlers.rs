@@ -26,6 +26,7 @@ pub struct SwitchRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReorderRequest {
     /// 被拖拽移动的 provider ID
     pub moved_id: String,
