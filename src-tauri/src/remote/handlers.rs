@@ -275,7 +275,8 @@ pub async fn reorder_providers(
     let item = sorted.remove(moved_idx);
     let new_idx = match before_idx {
         Some(idx) => {
-            let target = if idx > moved_idx { idx } else { idx };
+            // 移除 moved 后，若 moved 在 before 前面，before 的位置前移了一位
+            let target = if idx > moved_idx { idx - 1 } else { idx };
             target
         }
         None => sorted.len(), // 末尾
