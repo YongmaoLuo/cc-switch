@@ -3,7 +3,7 @@
 use super::html::REMOTE_HTML;
 use super::RemoteState;
 use crate::app_config::AppType;
-use crate::services::ProviderService;
+use crate::services::{ProviderService, ProviderSortUpdate};
 use crate::store::AppState;
 use axum::extract::State as AxumState;
 use axum::http::header;
@@ -23,6 +23,11 @@ const REMOTE_APP: AppType = AppType::Claude;
 #[derive(Deserialize)]
 pub struct SwitchRequest {
     pub provider_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReorderRequest {
+    pub updates: Vec<ProviderSortUpdate>,
 }
 
 fn app_state(state: &RemoteState) -> tauri::State<'_, AppState> {
@@ -196,6 +201,37 @@ pub async fn switch_provider(
         }
         Err(e) => {
             log::error!("[Remote] Switch failed: {e}");
+            Json(json!({"success": false, "error": e.to_string()})).into_response()
+        }
+    }
+}
+
+/// POST /api/reorder
+pub async fn reorder_providers(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    Json(body): Json<ReorderRequest>,
+) -> impl IntoResponse {
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    if body.updates.is_empty() {
+        return Json(json!({"success": false, "error": "Empty updates"})).into_response();
+    }
+
+    let app_state = app_state(&state);
+
+    match ProviderService::update_sort_order(app_state.inner(), REMOTE_APP, body.updates) {
+        Ok(_) => {
+            log::info!("[Remote] Reordered providers for {}", REMOTE_APP.as_str());
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) => {
+            log::error!("[Remote] Reorder failed: {e}");
             Json(json!({"success": false, "error": e.to_string()})).into_response()
         }
     }
