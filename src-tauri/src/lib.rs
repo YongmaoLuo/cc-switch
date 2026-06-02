@@ -36,6 +36,7 @@ mod tray;
 mod usage_events;
 mod usage_script;
 mod api;
+mod server;
 
 pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
@@ -1122,6 +1123,13 @@ pub fn run() {
             }
 
 
+            // 启动 Usage API Server
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = crate::server::start_usage_api_server().await {
+                    log::error!("Failed to start usage API server: {e}");
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1572,6 +1580,8 @@ pub fn run() {
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
+    crate::server::stop_usage_api_server().await;
+
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
 
