@@ -206,4 +206,194 @@ mod tests {
         // 恢复默认
         test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
     }
+
+    // ---- DTO mapping boundary tests ----
+
+    #[test]
+    fn test_dto_from_usage_result_zero() {
+        let result = UsageResult {
+            provider: "copilot".to_string(),
+            remaining_5h: 0.0,
+            remaining_weekly: 0.0,
+            unit: "tokens".to_string(),
+        };
+        let dto: ProviderUsageDto = result.into();
+        assert_eq!(dto.provider, "copilot");
+        assert_eq!(dto.remaining_5h, 0.0);
+        assert_eq!(dto.remaining_weekly, 0.0);
+        assert_eq!(dto.unit, "tokens");
+        assert!(!dto.updated_at.is_empty());
+    }
+
+    #[test]
+    fn test_dto_from_usage_result_negative() {
+        let result = UsageResult {
+            provider: "deepseek".to_string(),
+            remaining_5h: -1.0,
+            remaining_weekly: -100.5,
+            unit: "USD".to_string(),
+        };
+        let dto: ProviderUsageDto = result.into();
+        assert_eq!(dto.remaining_5h, -1.0);
+        assert_eq!(dto.remaining_weekly, -100.5);
+    }
+
+    #[test]
+    fn test_dto_from_usage_result_large() {
+        let large = i64::MAX as f64;
+        let result = UsageResult {
+            provider: "gemini".to_string(),
+            remaining_5h: large,
+            remaining_weekly: large,
+            unit: "requests".to_string(),
+        };
+        let dto: ProviderUsageDto = result.into();
+        assert_eq!(dto.remaining_5h, large);
+        assert_eq!(dto.remaining_weekly, large);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains("remaining_5h"));
+        assert!(json.contains("remaining_weekly"));
+    }
+
+    #[test]
+    fn test_dto_from_usage_result_empty_provider() {
+        let result = UsageResult {
+            provider: "".to_string(),
+            remaining_5h: 100.0,
+            remaining_weekly: 500.0,
+            unit: "tokens".to_string(),
+        };
+        let dto: ProviderUsageDto = result.into();
+        assert_eq!(dto.provider, "");
+        assert_eq!(dto.remaining_5h, 100.0);
+    }
+
+    // ---- Handler boundary tests ----
+
+    #[tokio::test]
+    #[serial]
+    async fn test_handler_boundary_zero() {
+        test_infrastructure::set_query_fn(Arc::new(|| {
+            Box::pin(async {
+                Ok(vec![ProviderUsageDto {
+                    provider: "copilot".to_string(),
+                    remaining_5h: 0.0,
+                    remaining_weekly: 0.0,
+                    unit: "tokens".to_string(),
+                    updated_at: "2026-06-02T12:00:00+08:00".to_string(),
+                }])
+            })
+        }))
+        .await;
+
+        let result = get_providers_usage().await;
+        assert!(result.is_ok());
+        let Json(dtos) = result.unwrap();
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].remaining_5h, 0.0);
+        assert_eq!(dtos[0].remaining_weekly, 0.0);
+
+        // Verify JSON serialization has zero values, not null or missing
+        let json = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(json.contains("\"remaining_5h\":0"));
+        assert!(json.contains("\"remaining_weekly\":0"));
+
+        // 恢复默认
+        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_handler_boundary_negative() {
+        test_infrastructure::set_query_fn(Arc::new(|| {
+            Box::pin(async {
+                Ok(vec![ProviderUsageDto {
+                    provider: "deepseek".to_string(),
+                    remaining_5h: -1.0,
+                    remaining_weekly: -1.0,
+                    unit: "USD".to_string(),
+                    updated_at: "2026-06-02T12:00:00+08:00".to_string(),
+                }])
+            })
+        }))
+        .await;
+
+        let result = get_providers_usage().await;
+        assert!(result.is_ok());
+        let Json(dtos) = result.unwrap();
+        assert_eq!(dtos[0].remaining_5h, -1.0);
+        assert_eq!(dtos[0].remaining_weekly, -1.0);
+
+        // Negative values are passed through as-is
+        let json = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(json.contains("\"remaining_5h\":-1"));
+        assert!(json.contains("\"remaining_weekly\":-1"));
+
+        // 恢复默认
+        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_handler_boundary_large() {
+        let large = i64::MAX as f64;
+        test_infrastructure::set_query_fn(Arc::new(move || {
+            let val = large;
+            Box::pin(async move {
+                Ok(vec![ProviderUsageDto {
+                    provider: "gemini".to_string(),
+                    remaining_5h: val,
+                    remaining_weekly: val,
+                    unit: "requests".to_string(),
+                    updated_at: "2026-06-02T12:00:00+08:00".to_string(),
+                }])
+            })
+        }))
+        .await;
+
+        let result = get_providers_usage().await;
+        assert!(result.is_ok());
+        let Json(dtos) = result.unwrap();
+        assert_eq!(dtos[0].remaining_5h, large);
+        assert_eq!(dtos[0].remaining_weekly, large);
+
+        // JSON serializes correctly without overflow
+        let json = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(json.contains("remaining_5h"));
+        assert!(json.contains("remaining_weekly"));
+        // Should not be Infinity in JSON
+        assert!(!json.contains("Infinity"));
+
+        // 恢复默认
+        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_handler_empty_provider() {
+        test_infrastructure::set_query_fn(Arc::new(|| {
+            Box::pin(async {
+                Ok(vec![ProviderUsageDto {
+                    provider: "".to_string(),
+                    remaining_5h: 100.0,
+                    remaining_weekly: 500.0,
+                    unit: "tokens".to_string(),
+                    updated_at: "2026-06-02T12:00:00+08:00".to_string(),
+                }])
+            })
+        }))
+        .await;
+
+        let result = get_providers_usage().await;
+        assert!(result.is_ok());
+        let Json(dtos) = result.unwrap();
+        assert_eq!(dtos[0].provider, "");
+
+        // Empty provider is allowed and serialized as empty string
+        let json = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(json.contains("\"provider\":\"\""));
+
+        // 恢复默认
+        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+    }
 }
