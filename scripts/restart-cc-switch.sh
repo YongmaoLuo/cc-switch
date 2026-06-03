@@ -187,6 +187,62 @@ wait_remote_ready() {
     return 1
 }
 
+# 8. 通过 RESTful API 重新拉起路由代理（接管 Live 配置）
+#    步骤 1 已经把代理 stop 了（restore 了 Live 配置，并把所有 app 的 enabled 置 false），
+#    重启之后代理不会自动起来，Claude Code 的 ANTHROPIC_BASE_URL
+#    会保留为 provider 自己的 URL → Claude 直连上游，绕过 CC Switch。
+#
+#    已有端点 /api/proxy/takeover 在 enabled=true 时会自动调用 start() 把代理拉起来，
+#    再接管该 app 的 Live 配置（见 services/proxy.rs::set_takeover_for_app）。
+#    所以我们对每个支持的 app 调一次 takeover 即可恢复路由代理：
+#      - 第一次调用启动代理服务器（start 是幂等的）
+#      - 后续调用对其他 app 接管 Live 配置
+start_proxy_via_api() {
+    echo "==> 通过 /api/proxy/takeover 重新拉起路由代理（接管 Live 配置）..."
+    local any_success=false
+    for app_type in claude codex gemini; do
+        local response http_code
+        # 分离 HTTP 状态码和 body：curl -w 把状态码写到 stderr
+        response=$(curl -sS -X POST --max-time 10 \
+            -H "Content-Type: application/json" \
+            -d "{\"appType\": \"${app_type}\", \"enabled\": true}" \
+            -w "\n%{http_code}" \
+            "http://127.0.0.1:${REMOTE_PORT}/api/proxy/takeover" 2>&1)
+        http_code=$(echo "${response}" | tail -n 1)
+        response=$(echo "${response}" | sed '$d')
+
+        # 区分三种情况：
+        #   1) HTTP 非 2xx          → 网络/服务错误
+        #   2) HTTP 200 + success=true  → 接管成功（包含代理启动）
+        #   3) HTTP 200 + success=false → 业务失败（如该 app 没有 Live 配置）
+        if [[ "${http_code}" =~ ^2 ]]; then
+            if echo "${response}" | jq -e '.success == true' >/dev/null 2>&1; then
+                echo "    ✓ ${app_type} 接管成功：${response}"
+                any_success=true
+            else
+                echo "    ! ${app_type} 业务失败：${response}" >&2
+            fi
+        else
+            echo "    ! ${app_type} HTTP ${http_code}：${response}" >&2
+        fi
+    done
+
+    if [[ "${any_success}" != "true" ]]; then
+        return 1
+    fi
+
+    # 等代理端口 15721 真正起来（接管 + bind socket 需要几秒）
+    for i in {1..15}; do
+        if lsof -nP -iTCP:${PROXY_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "    ✓ 端口 ${PROXY_PORT} 已监听"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "    ! 端口 ${PROXY_PORT} 在 15 秒内未监听" >&2
+    return 1
+}
+
 main() {
     echo "================================================"
     echo " CC Switch 安全重启脚本"
@@ -219,6 +275,17 @@ main() {
 
     # 6. 等远程服务（仅新二进制会有）
     wait_remote_ready || true
+
+    # 7. 重新拉起路由代理（接管 Live 配置）
+    #    仅当 step 1 的 stop 成功时才需要 — 成功说明老二进制支持新 API，
+    #    新二进制也支持 /api/proxy/takeover 配套恢复。
+    if [[ "${api_success}" == "true" ]]; then
+        start_proxy_via_api || true
+    else
+        echo ""
+        echo "ℹ️  跳过代理恢复（老二进制不支持 /api/proxy/stop，"
+        echo "   新二进制接管后请手动在 GUI 启用代理或调 /api/proxy/takeover）。"
+    fi
 
     echo ""
     echo "================================================"
