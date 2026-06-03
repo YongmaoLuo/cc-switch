@@ -472,13 +472,13 @@ pub async fn get_provider_icon(
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct ProxyStopRequest {
+pub struct ProxyControlRequest {
     /// true  = 启动代理（带 Live 配置接管，覆盖所有 app）
     /// false = 停止代理（恢复 Live 配置）— 默认
     pub start: bool,
 }
 
-/// POST /api/proxy/stop — 统一控制代理的停止与启动
+/// POST /api/proxy/control — 统一控制代理的停止与启动
 ///
 /// Body（可选）：
 ///   - `{}` 或缺省                  → 停止代理并恢复 Live 配置
@@ -487,9 +487,9 @@ pub struct ProxyStopRequest {
 ///
 /// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
 /// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
-pub async fn stop_proxy(
+pub async fn proxy_control(
     AxumState(state): AxumState<Arc<RemoteState>>,
-    body: Option<Json<ProxyStopRequest>>,
+    body: Option<Json<ProxyControlRequest>>,
 ) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
         return (

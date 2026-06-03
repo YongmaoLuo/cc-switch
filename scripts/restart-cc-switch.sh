@@ -2,17 +2,17 @@
 # restart-cc-switch.sh — 安全停止并重启 CC Switch 桌面 app
 #
 # 端口分工（重要！）：
-#   - 4000: 远程管理服务（控制面）— /api/proxy/stop、/api/usage、/api/switch 等
+#   - 4000: 远程管理服务（控制面）— /api/proxy/control、/api/usage、/api/switch 等
 #   - 15721: 代理服务（数据面，Claude 流量转发）
 #
 # 为什么必须先关代理？
 #   Claude Code 的 ~/.claude/settings.json 里 ANTHROPIC_BASE_URL 指向 127.0.0.1:15721。
 #   如果 CC Switch 退出时没把代理停掉，Live 配置没回写到 provider 自己的 URL，
 #   Claude 客户端调模型时 15721 端口已死 → Claude 整个挂掉。
-#   /api/proxy/stop 会调用 stop_with_restore() 把 Live 配置改回 provider 自己的 URL。
+#   /api/proxy/control 会调用 stop_with_restore() 把 Live 配置改回 provider 自己的 URL。
 #
 # 步骤：
-#   1. 尝试通过 4000 端口的 /api/proxy/stop 关闭代理（新二进制才有 API）
+#   1. 尝试通过 4000 端口的 /api/proxy/control 关闭代理（新二进制才有 API）
 #      - 新二进制：API 成功 → 后续一切正常
 #      - 老二进制：API 失败 → 仍然优雅退出 CC Switch（osascript quit 会触发 Tauri 关闭流程，
 #        也会写回 Live 配置；但不保证 100% 触发 stop_with_restore）
@@ -21,7 +21,7 @@
 #   4. 备份整个 .app bundle，用新构建的 .app 替换
 #   5. 用 `open -n -a` 启动 app（避免当前 shell 环境变量污染 Tauri 启动）
 #   6. 等待 4000 端口的远程管理服务就绪（确认新二进制已起来）
-#   7. 通过同一个 /api/proxy/stop + body {"start": true} 重新拉起路由代理
+#   7. 通过同一个 /api/proxy/control + body {"start": true} 重新拉起路由代理
 #      （统一端点：stop 模式无 body → 停止；start 模式带 start:true → 启动并接管 Live）
 
 set -euo pipefail
@@ -58,15 +58,32 @@ echo "==> 目标路径：${APP_BUNDLE}"
 
 # 2. 尝试通过 remote API 关闭代理（仅新二进制支持）
 stop_proxy_via_api() {
-    echo "==> 尝试通过 http://127.0.0.1:${REMOTE_PORT}/api/proxy/stop 关闭代理..."
-    local response
-    if response=$(curl -sS -X POST --max-time 5 "http://127.0.0.1:${REMOTE_PORT}/api/proxy/stop" 2>/dev/null); then
-        echo "    ✓ 远程 API 关闭代理成功：${response}"
-        return 0
-    else
-        echo "    ! 远程 API 不可用（老二进制或远程服务未启用）"
+    echo "==> 尝试通过 http://127.0.0.1:${REMOTE_PORT}/api/proxy/control 关闭代理..."
+    local response http_code
+    response=$(curl -sS -X POST --max-time 5 \
+        -w "\n%{http_code}" \
+        "http://127.0.0.1:${REMOTE_PORT}/api/proxy/control" 2>/dev/null)
+    http_code=$(echo "${response}" | tail -n 1)
+    response=$(echo "${response}" | sed '$d')
+
+    # 区分三种情况：
+    #   1) curl 失败（网络错误）    → 远程服务未启用
+    #   2) HTTP 非 2xx              → 老二进制（无 /api/proxy/control，返回 404）
+    #   3) HTTP 200 + success=true  → 停止成功
+    if [[ -z "${http_code}" ]]; then
+        echo "    ! 远程 API 不可用（远程服务未启用）"
         return 1
     fi
+    if [[ ! "${http_code}" =~ ^2 ]]; then
+        echo "    ! 远程 API 返回 HTTP ${http_code}（老二进制或端点不存在）"
+        return 1
+    fi
+    if echo "${response}" | jq -e '.success == true' >/dev/null 2>&1; then
+        echo "    ✓ 远程 API 关闭代理成功：${response}"
+        return 0
+    fi
+    echo "    ! 远程 API 业务失败：${response}"
+    return 1
 }
 
 # 3. 等待代理端口 15721 真正释放
@@ -194,18 +211,18 @@ wait_remote_ready() {
 #    重启之后代理不会自动起来，Claude Code 的 ANTHROPIC_BASE_URL
 #    会保留为 provider 自己的 URL → Claude 直连上游，绕过 CC Switch。
 #
-#    用统一的 POST /api/proxy/stop + body {"start": true}：
+#    用统一的 POST /api/proxy/control + body {"start": true}：
 #      - 单一端点既停止又开启（避免维护两套 endpoint）
 #      - 内部调用 start_with_takeover() 一次性把代理拉起来 + 接管所有 app 的 Live 配置
 #      - 幂等：start() 内部 is_running() 检查，set_takeover_for_app 在已接管时早退
 start_proxy_via_api() {
-    echo "==> 通过 POST /api/proxy/stop {\"start\": true} 重新拉起路由代理（接管 Live 配置）..."
+    echo "==> 通过 POST /api/proxy/control {\"start\": true} 重新拉起路由代理（接管 Live 配置）..."
     local response http_code
     response=$(curl -sS -X POST --max-time 10 \
         -H "Content-Type: application/json" \
         -d '{"start": true}' \
         -w "\n%{http_code}" \
-        "http://127.0.0.1:${REMOTE_PORT}/api/proxy/stop" 2>&1)
+        "http://127.0.0.1:${REMOTE_PORT}/api/proxy/control" 2>&1)
     http_code=$(echo "${response}" | tail -n 1)
     response=$(echo "${response}" | sed '$d')
 
@@ -242,7 +259,7 @@ main() {
     echo " CC Switch 安全重启脚本"
     echo "================================================"
     echo ""
-    echo "⚠️  关闭代理前请确保 /api/proxy/stop 成功，否则"
+    echo "⚠️  关闭代理前请确保 /api/proxy/control 成功，否则"
     echo "   Claude Code 的 ANTHROPIC_BASE_URL 会指向死端口，"
     echo "   导致 Claude 客户端调不通模型。"
     echo ""
@@ -272,13 +289,13 @@ main() {
 
     # 7. 重新拉起路由代理（接管 Live 配置）
     #    仅当 step 1 的 stop 成功时才需要 — 成功说明老二进制支持新 API，
-    #    新二进制也支持 /api/proxy/takeover 配套恢复。
+    #    新二进制也支持 /api/proxy/control (start=true) 配套恢复。
     if [[ "${api_success}" == "true" ]]; then
         start_proxy_via_api || true
     else
         echo ""
-        echo "ℹ️  跳过代理恢复（老二进制不支持 /api/proxy/stop，"
-        echo "   新二进制接管后请手动在 GUI 启用代理或调 /api/proxy/takeover）。"
+        echo "ℹ️  跳过代理恢复（老二进制不支持 /api/proxy/control，"
+        echo "   新二进制接管后请手动在 GUI 启用代理或调 /api/proxy/control {\"start\": true}）。"
     fi
 
     echo ""
@@ -288,7 +305,7 @@ main() {
     echo "   curl http://127.0.0.1:${REMOTE_PORT}/api/usage"
     if [[ "${api_success}" == "false" ]]; then
         echo ""
-        echo "⚠️  首次重启时 /api/proxy/stop 不可用，Claude Code 的"
+        echo "⚠️  首次重启时 /api/proxy/control 不可用，Claude Code 的"
         echo "   ANTHROPIC_BASE_URL 可能仍指向 127.0.0.1:15721。"
         echo "   建议检查 ~/.claude/settings.json，必要时手动改为"
         echo "   provider 自己的 URL（Anthropic / Zhipu 等）。"

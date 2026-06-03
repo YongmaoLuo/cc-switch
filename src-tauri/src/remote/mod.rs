@@ -385,7 +385,7 @@ impl RemoteServer {
                 "/api/provider-icons/:name",
                 axum::routing::get(handlers::get_provider_icon),
             )
-            .route("/api/proxy/stop", axum::routing::post(handlers::stop_proxy))
+            .route("/api/proxy/control", axum::routing::post(handlers::proxy_control))
             .route(
                 "/api/proxy/takeover",
                 axum::routing::post(handlers::proxy_takeover),
