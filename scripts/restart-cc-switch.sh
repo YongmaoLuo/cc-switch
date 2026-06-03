@@ -288,15 +288,11 @@ main() {
     wait_remote_ready || true
 
     # 7. 重新拉起路由代理（接管 Live 配置）
-    #    仅当 step 1 的 stop 成功时才需要 — 成功说明老二进制支持新 API，
-    #    新二进制也支持 /api/proxy/control (start=true) 配套恢复。
-    if [[ "${api_success}" == "true" ]]; then
-        start_proxy_via_api || true
-    else
-        echo ""
-        echo "ℹ️  跳过代理恢复（老二进制不支持 /api/proxy/control，"
-        echo "   新二进制接管后请手动在 GUI 启用代理或调 /api/proxy/control {\"start\": true}）。"
-    fi
+    #    总是执行：step 5/6 之后新二进制已经起来了，新二进制支持 /api/proxy/control。
+    #    即使 step 1 失败（升级路径：老二进制没这个 API），这里仍要把代理拉起，
+    #    否则 Claude Code 的 ANTHROPIC_BASE_URL 会指向死端口。
+    #    用 || true 兜底 — 如果新二进制本身有问题（极少见），也不阻塞脚本。
+    start_proxy_via_api || true
 
     echo ""
     echo "================================================"
@@ -305,10 +301,8 @@ main() {
     echo "   curl http://127.0.0.1:${REMOTE_PORT}/api/usage"
     if [[ "${api_success}" == "false" ]]; then
         echo ""
-        echo "⚠️  首次重启时 /api/proxy/control 不可用，Claude Code 的"
-        echo "   ANTHROPIC_BASE_URL 可能仍指向 127.0.0.1:15721。"
-        echo "   建议检查 ~/.claude/settings.json，必要时手动改为"
-        echo "   provider 自己的 URL（Anthropic / Zhipu 等）。"
+        echo "ℹ️  Step 1 停代理 API 不可用（升级场景：老二进制），但 step 7"
+        echo "   已通过新二进制自动恢复代理状态。可忽略此提示。"
     fi
     echo "================================================"
 }
