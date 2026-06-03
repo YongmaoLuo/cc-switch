@@ -21,6 +21,8 @@
 #   4. 备份整个 .app bundle，用新构建的 .app 替换
 #   5. 用 `open -n -a` 启动 app（避免当前 shell 环境变量污染 Tauri 启动）
 #   6. 等待 4000 端口的远程管理服务就绪（确认新二进制已起来）
+#   7. 通过同一个 /api/proxy/stop + body {"start": true} 重新拉起路由代理
+#      （统一端点：stop 模式无 body → 停止；start 模式带 start:true → 启动并接管 Live）
 
 set -euo pipefail
 
@@ -192,42 +194,34 @@ wait_remote_ready() {
 #    重启之后代理不会自动起来，Claude Code 的 ANTHROPIC_BASE_URL
 #    会保留为 provider 自己的 URL → Claude 直连上游，绕过 CC Switch。
 #
-#    已有端点 /api/proxy/takeover 在 enabled=true 时会自动调用 start() 把代理拉起来，
-#    再接管该 app 的 Live 配置（见 services/proxy.rs::set_takeover_for_app）。
-#    所以我们对每个支持的 app 调一次 takeover 即可恢复路由代理：
-#      - 第一次调用启动代理服务器（start 是幂等的）
-#      - 后续调用对其他 app 接管 Live 配置
+#    用统一的 POST /api/proxy/stop + body {"start": true}：
+#      - 单一端点既停止又开启（避免维护两套 endpoint）
+#      - 内部调用 start_with_takeover() 一次性把代理拉起来 + 接管所有 app 的 Live 配置
+#      - 幂等：start() 内部 is_running() 检查，set_takeover_for_app 在已接管时早退
 start_proxy_via_api() {
-    echo "==> 通过 /api/proxy/takeover 重新拉起路由代理（接管 Live 配置）..."
-    local any_success=false
-    for app_type in claude codex gemini; do
-        local response http_code
-        # 分离 HTTP 状态码和 body：curl -w 把状态码写到 stderr
-        response=$(curl -sS -X POST --max-time 10 \
-            -H "Content-Type: application/json" \
-            -d "{\"appType\": \"${app_type}\", \"enabled\": true}" \
-            -w "\n%{http_code}" \
-            "http://127.0.0.1:${REMOTE_PORT}/api/proxy/takeover" 2>&1)
-        http_code=$(echo "${response}" | tail -n 1)
-        response=$(echo "${response}" | sed '$d')
+    echo "==> 通过 POST /api/proxy/stop {\"start\": true} 重新拉起路由代理（接管 Live 配置）..."
+    local response http_code
+    response=$(curl -sS -X POST --max-time 10 \
+        -H "Content-Type: application/json" \
+        -d '{"start": true}' \
+        -w "\n%{http_code}" \
+        "http://127.0.0.1:${REMOTE_PORT}/api/proxy/stop" 2>&1)
+    http_code=$(echo "${response}" | tail -n 1)
+    response=$(echo "${response}" | sed '$d')
 
-        # 区分三种情况：
-        #   1) HTTP 非 2xx          → 网络/服务错误
-        #   2) HTTP 200 + success=true  → 接管成功（包含代理启动）
-        #   3) HTTP 200 + success=false → 业务失败（如该 app 没有 Live 配置）
-        if [[ "${http_code}" =~ ^2 ]]; then
-            if echo "${response}" | jq -e '.success == true' >/dev/null 2>&1; then
-                echo "    ✓ ${app_type} 接管成功：${response}"
-                any_success=true
-            else
-                echo "    ! ${app_type} 业务失败：${response}" >&2
-            fi
+    # 区分三种情况：
+    #   1) HTTP 非 2xx          → 网络/服务错误
+    #   2) HTTP 200 + success=true  → 启动 + 接管成功
+    #   3) HTTP 200 + success=false → 业务失败（如 Live 配置缺失）
+    if [[ "${http_code}" =~ ^2 ]]; then
+        if echo "${response}" | jq -e '.success == true' >/dev/null 2>&1; then
+            echo "    ✓ 代理启动成功：${response}"
         else
-            echo "    ! ${app_type} HTTP ${http_code}：${response}" >&2
+            echo "    ! 代理启动业务失败：${response}" >&2
+            return 1
         fi
-    done
-
-    if [[ "${any_success}" != "true" ]]; then
+    else
+        echo "    ! 代理启动 HTTP ${http_code}：${response}" >&2
         return 1
     fi
 

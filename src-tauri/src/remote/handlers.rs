@@ -470,11 +470,27 @@ pub async fn get_provider_icon(
     )
 }
 
-/// POST /api/proxy/stop — 停止代理服务器并恢复 Live 配置
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProxyStopRequest {
+    /// true  = 启动代理（带 Live 配置接管，覆盖所有 app）
+    /// false = 停止代理（恢复 Live 配置）— 默认
+    pub start: bool,
+}
+
+/// POST /api/proxy/stop — 统一控制代理的停止与启动
+///
+/// Body（可选）：
+///   - `{}` 或缺省                  → 停止代理并恢复 Live 配置
+///   - `{"start": true}`            → 启动代理并接管所有 app 的 Live 配置
+///   - `{"start": false}`           → 停止代理（与默认行为相同）
 ///
 /// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
 /// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
-pub async fn stop_proxy(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
+pub async fn stop_proxy(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    body: Option<Json<ProxyStopRequest>>,
+) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -484,15 +500,44 @@ pub async fn stop_proxy(AxumState(state): AxumState<Arc<RemoteState>>) -> impl I
     }
 
     let app_state = app_state(&state);
+    let start = body.map(|Json(b)| b.start).unwrap_or(false);
 
-    match app_state.proxy_service.stop_with_restore().await {
-        Ok(()) => {
-            log::info!("[Remote] Proxy stopped and live configs restored via API");
-            Json(json!({"success": true})).into_response()
+    if start {
+        // 启动代理 + 接管所有 app 的 Live 配置。
+        // 幂等：start_with_takeover() 内部会先 is_running() 检查；
+        // 如果 Live config 已被接管且指向当前代理，set_takeover_for_app 也会早退。
+        match app_state.proxy_service.start_with_takeover().await {
+            Ok(info) => {
+                log::info!(
+                    "[Remote] Proxy started and live configs taken over via API: {}:{}",
+                    info.address,
+                    info.port
+                );
+                Json(json!({
+                    "success": true,
+                    "action": "start",
+                    "address": info.address,
+                    "port": info.port,
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                log::error!("[Remote] Failed to start proxy via API: {e}");
+                Json(json!({"success": false, "action": "start", "error": e.to_string()}))
+                    .into_response()
+            }
         }
-        Err(e) => {
-            log::error!("[Remote] Failed to stop proxy via API: {e}");
-            Json(json!({"success": false, "error": e.to_string()})).into_response()
+    } else {
+        match app_state.proxy_service.stop_with_restore().await {
+            Ok(()) => {
+                log::info!("[Remote] Proxy stopped and live configs restored via API");
+                Json(json!({"success": true, "action": "stop"})).into_response()
+            }
+            Err(e) => {
+                log::error!("[Remote] Failed to stop proxy via API: {e}");
+                Json(json!({"success": false, "action": "stop", "error": e.to_string()}))
+                    .into_response()
+            }
         }
     }
 }
