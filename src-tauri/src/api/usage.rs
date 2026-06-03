@@ -1,4 +1,4 @@
-use axum::{Json, Router, extract::State, http::StatusCode};
+use axum::{extract::State, http::StatusCode, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -54,12 +54,15 @@ impl From<UsageResult> for ProviderUsageDto {
 }
 
 pub type QueryResult = Result<Vec<ProviderUsageDto>, String>;
+#[allow(dead_code)]
 pub type QueryFuture = Pin<Box<dyn Future<Output = QueryResult> + Send>>;
+#[allow(dead_code)]
 pub type QueryFn = Arc<dyn Fn(AppState) -> QueryFuture + Send + Sync>;
 
 /// 全局 Copilot 认证状态（供 Usage API 独立进程使用）
-static USAGE_COPILOT_AUTH: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::proxy::providers::copilot_auth::CopilotAuthManager>>> =
-    std::sync::OnceLock::new();
+static USAGE_COPILOT_AUTH: std::sync::OnceLock<
+    Arc<tokio::sync::RwLock<crate::proxy::providers::copilot_auth::CopilotAuthManager>>,
+> = std::sync::OnceLock::new();
 
 /// 初始化 Usage API 所需的 Copilot 认证状态
 pub fn init_usage_copilot_auth(
@@ -189,7 +192,9 @@ mod test_infrastructure {
     use tokio::sync::RwLock;
 
     pub static QUERY_FN: Lazy<RwLock<QueryFn>> = Lazy::new(|| {
-        RwLock::new(Arc::new(|state| Box::pin(super::default_query_provider_usage_inner(state))))
+        RwLock::new(Arc::new(|state| {
+            Box::pin(super::default_query_provider_usage_inner(state))
+        }))
     });
 
     pub async fn set_query_fn(f: QueryFn) {
@@ -310,10 +315,7 @@ mod tests {
     #[serial]
     async fn test_handler_empty() {
         let app_state = test_app_state();
-        test_infrastructure::set_query_fn(Arc::new(|_state| {
-            Box::pin(async { Ok(vec![]) })
-        }))
-        .await;
+        test_infrastructure::set_query_fn(Arc::new(|_state| Box::pin(async { Ok(vec![]) }))).await;
 
         let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());

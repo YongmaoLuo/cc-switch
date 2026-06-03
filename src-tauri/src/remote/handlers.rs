@@ -276,8 +276,11 @@ pub async fn reorder_providers(
     let new_idx = match before_idx {
         Some(idx) => {
             // 移除 moved 后，若 moved 在 before 前面，before 的位置前移了一位
-            let target = if idx > moved_idx { idx - 1 } else { idx };
-            target
+            if idx > moved_idx {
+                idx - 1
+            } else {
+                idx
+            }
         }
         None => sorted.len(), // 末尾
     };
@@ -470,9 +473,7 @@ pub async fn get_provider_icon(
 ///
 /// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
 /// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
-pub async fn stop_proxy(
-    AxumState(state): AxumState<Arc<RemoteState>>,
-) -> impl IntoResponse {
+pub async fn stop_proxy(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -593,7 +594,8 @@ pub async fn proxy_failover(
                 match crate::settings::get_effective_current_provider(&app_state.db, &app_enum) {
                     Ok(id) => id,
                     Err(e) => {
-                        return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                        return Json(json!({"success": false, "error": e.to_string()}))
+                            .into_response();
                     }
                 };
 
@@ -604,7 +606,10 @@ pub async fn proxy_failover(
                 .into_response();
             };
 
-            if let Err(e) = app_state.db.add_to_failover_queue(&body.app_type, &current_id) {
+            if let Err(e) = app_state
+                .db
+                .add_to_failover_queue(&body.app_type, &current_id)
+            {
                 return Json(json!({"success": false, "error": e.to_string()})).into_response();
             }
 
