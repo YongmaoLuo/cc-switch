@@ -33,8 +33,6 @@ mod session_manager;
 mod settings;
 mod store;
 
-mod api;
-mod server;
 mod tray;
 mod usage_events;
 mod usage_script;
@@ -71,22 +69,6 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
-
-#[cfg(target_os = "windows")]
-fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
-    let app_id = app.config().identifier.clone();
-    let wide_app_id: Vec<u16> = app_id.encode_utf16().chain(std::iter::once(0)).collect();
-
-    let result = unsafe {
-        windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(wide_app_id.as_ptr())
-    };
-
-    if result < 0 {
-        log::warn!("设置 Windows AppUserModelID 失败: 0x{result:08X}");
-    } else {
-        log::debug!("Windows AppUserModelID 已设置为 {app_id}");
-    }
-}
 
 fn redact_url_for_log(url_str: &str) -> String {
     match url::Url::parse(url_str) {
@@ -342,8 +324,6 @@ pub fn run() {
             // 预先刷新 Store 覆盖配置，确保后续路径读取正确（日志/数据库等）
             app_store::refresh_app_config_dir_override(app.handle());
             panic_hook::init_app_config_dir(crate::config::get_app_config_dir());
-            #[cfg(target_os = "windows")]
-            set_windows_app_user_model_id(app.handle());
 
             // 注册 Updater 插件（桌面端）
             #[cfg(desktop)]
@@ -921,12 +901,6 @@ pub fn run() {
                 app_state.db.clone(),
                 app.handle().clone(),
             );
-            crate::services::s3_auto_sync::start_worker(
-                app_state.db.clone(),
-                app.handle().clone(),
-            );
-            // 将同一个实例注入到全局状态，避免重复创建导致的不一致
-            let app_state_for_server = app_state.clone();
             app.manage(app_state);
 
             // 启动 Remote Management HTTP Server
@@ -983,7 +957,6 @@ pub fn run() {
                 let copilot_auth_manager = CopilotAuthManager::new(app_config_dir);
                 let copilot_auth_arc = Arc::new(RwLock::new(copilot_auth_manager));
                 app.manage(CopilotAuthState(copilot_auth_arc.clone()));
-                crate::api::usage::init_usage_copilot_auth(copilot_auth_arc);
                 log::info!("✓ CopilotAuthManager initialized");
             }
 
@@ -1111,10 +1084,6 @@ pub fn run() {
                         "Gemini usage initial sync",
                         crate::services::session_usage_gemini::sync_gemini_usage(db),
                     );
-                    run_step(
-                        "OpenCode usage initial sync",
-                        crate::services::session_usage_opencode::sync_opencode_usage(db),
-                    );
 
                     // 定期同步
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1134,10 +1103,6 @@ pub fn run() {
                         run_step(
                             "Gemini usage periodic sync",
                             crate::services::session_usage_gemini::sync_gemini_usage(db),
-                        );
-                        run_step(
-                            "OpenCode usage periodic sync",
-                            crate::services::session_usage_opencode::sync_opencode_usage(db),
                         );
                     }
                 });
@@ -1188,13 +1153,6 @@ pub fn run() {
                 }
             }
 
-
-            // 启动 Usage API Server
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = crate::server::start_usage_api_server(app_state_for_server).await {
-                    log::error!("Failed to start usage API server: {e}");
-                }
-            });
 
             Ok(())
         })
@@ -1303,11 +1261,6 @@ pub fn run() {
             commands::webdav_sync_download,
             commands::webdav_sync_save_settings,
             commands::webdav_sync_fetch_remote_info,
-            commands::s3_test_connection,
-            commands::s3_sync_upload,
-            commands::s3_sync_download,
-            commands::s3_sync_save_settings,
-            commands::s3_sync_fetch_remote_info,
             commands::save_file_dialog,
             commands::open_file_dialog,
             commands::open_zip_file_dialog,
@@ -1652,8 +1605,6 @@ pub fn run() {
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
-    crate::server::stop_usage_api_server().await;
-
     if let Some(state) = app_handle.try_state::<store::AppState>() {
         let proxy_service = &state.proxy_service;
 

@@ -366,6 +366,10 @@ impl RemoteServer {
                 axum::routing::get(handlers::get_providers),
             )
             .route(
+                "/api/usage",
+                axum::routing::get(handlers::get_usage),
+            )
+            .route(
                 "/api/switch",
                 axum::routing::post(handlers::switch_provider),
             )

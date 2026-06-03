@@ -3,6 +3,7 @@
 use super::html::REMOTE_HTML;
 use super::RemoteState;
 use crate::app_config::AppType;
+use crate::commands::{self, CopilotAuthState};
 use crate::services::{ProviderService, ProviderSortUpdate};
 use crate::store::AppState;
 use axum::extract::State as AxumState;
@@ -10,7 +11,7 @@ use axum::http::header;
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json};
 use futures::stream::Stream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
@@ -688,4 +689,130 @@ pub async fn proxy_failover(
     );
 
     Json(json!({"success": true})).into_response()
+}
+
+/// 单个 tier 的用量 DTO
+#[derive(Debug, Clone, Serialize)]
+pub struct TierUsageDto {
+    pub name: String,
+    pub used_percent: f64,
+    pub remaining: f64,
+    pub total: f64,
+    pub unit: String,
+    pub resets_at: Option<String>,
+}
+
+/// Provider 用量 DTO
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderUsageDto {
+    pub provider: String,
+    pub app_type: String,
+    pub tiers: Vec<TierUsageDto>,
+    pub updated_at: String,
+}
+
+/// GET /api/usage — 实时查询所有 enabled provider 的官方用量
+///
+/// 与 /api/providers 不同：本接口不返回状态/配置，而是触发一次实时查询
+/// 拉取每个 provider 官方的 quota 数据（5h/周限额/余额等）并合并为统一 DTO。
+pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    let app_state = state.app_handle.state::<AppState>();
+    let copilot_state = state.app_handle.state::<CopilotAuthState>();
+
+    let mut results: Vec<ProviderUsageDto> = Vec::new();
+
+    for app_type in AppType::all() {
+        let providers = match app_state.db.get_all_providers(app_type.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[Remote] Failed to get providers for {}: {e}", app_type.as_str());
+                continue;
+            }
+        };
+
+        for (provider_id, provider) in providers {
+            // 只查询启用了 usage_script 的 provider
+            if !provider.has_usage_script_enabled() {
+                continue;
+            }
+
+            let template_type = provider
+                .meta
+                .as_ref()
+                .and_then(|m| m.usage_script.as_ref())
+                .and_then(|s| s.template_type.as_deref())
+                .unwrap_or("");
+
+            // Copilot provider 必须先有 OAuth 登录；未登录时静默跳过
+            if template_type == "github_copilot" {
+                let auth = copilot_state.0.read().await;
+                if !auth.is_authenticated().await {
+                    log::debug!(
+                        "[Remote] Skipping Copilot provider {}: not authenticated",
+                        provider_id
+                    );
+                    continue;
+                }
+            }
+
+            let query_result = commands::query_provider_usage_inner(
+                app_state.inner(),
+                copilot_state.inner(),
+                app_type.clone(),
+                &provider_id,
+            )
+            .await;
+
+            let usage_result = match query_result {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("[Remote] Usage query failed for {}: {e}", provider_id);
+                    continue;
+                }
+            };
+
+            if !usage_result.success {
+                log::warn!(
+                    "[Remote] Usage query returned failure for {}: {:?}",
+                    provider_id,
+                    usage_result.error
+                );
+                continue;
+            }
+
+            let data = match usage_result.data {
+                Some(d) if !d.is_empty() => d,
+                _ => continue,
+            };
+
+            let tiers: Vec<TierUsageDto> = data
+                .iter()
+                .map(|d| TierUsageDto {
+                    name: d.plan_name.clone().unwrap_or_default(),
+                    used_percent: d.used.unwrap_or(0.0),
+                    remaining: d.remaining.unwrap_or(0.0),
+                    total: d.total.unwrap_or(0.0),
+                    unit: d.unit.clone().unwrap_or_default(),
+                    resets_at: d.extra.clone(),
+                })
+                .collect();
+
+            results.push(ProviderUsageDto {
+                provider: provider.name.clone(),
+                app_type: app_type.as_str().to_string(),
+                tiers,
+                updated_at: chrono::Local::now().to_rfc3339(),
+            });
+        }
+    }
+
+    Json(json!({ "providers": results })).into_response()
 }
