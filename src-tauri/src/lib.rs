@@ -890,6 +890,7 @@ pub fn run() {
                 app.handle().clone(),
             );
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
+            let app_state_for_server = app_state.clone();
             app.manage(app_state);
 
             // 从数据库加载日志配置并应用
@@ -917,7 +918,9 @@ pub fn run() {
 
                 let app_config_dir = crate::config::get_app_config_dir();
                 let copilot_auth_manager = CopilotAuthManager::new(app_config_dir);
-                app.manage(CopilotAuthState(Arc::new(RwLock::new(copilot_auth_manager))));
+                let copilot_auth_arc = Arc::new(RwLock::new(copilot_auth_manager));
+                app.manage(CopilotAuthState(copilot_auth_arc.clone()));
+                crate::api::usage::init_usage_copilot_auth(copilot_auth_arc);
                 log::info!("✓ CopilotAuthManager initialized");
             }
 
@@ -1124,8 +1127,8 @@ pub fn run() {
 
 
             // 启动 Usage API Server
-            tauri::async_runtime::spawn(async {
-                if let Err(e) = crate::server::start_usage_api_server().await {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::server::start_usage_api_server(app_state_for_server).await {
                     log::error!("Failed to start usage API server: {e}");
                 }
             });

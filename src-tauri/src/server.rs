@@ -4,6 +4,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex};
 
+use crate::store::AppState;
+
 static SERVER_STATE: once_cell::sync::Lazy<Arc<Mutex<ServerState>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(ServerState::default())));
 
@@ -13,14 +15,14 @@ struct ServerState {
     shutdown_tx: Option<watch::Sender<()>>,
 }
 
-pub fn create_app() -> Router {
-    crate::api::usage::usage_routes()
+pub fn create_app(state: AppState) -> Router {
+    crate::api::usage::usage_routes(state)
 }
 
-pub async fn start_usage_api_server() -> Result<(), String> {
-    let mut state = SERVER_STATE.lock().await;
+pub async fn start_usage_api_server(state: AppState) -> Result<(), String> {
+    let mut server_state = SERVER_STATE.lock().await;
 
-    if state.handle.is_some() {
+    if server_state.handle.is_some() {
         log::info!("Usage API server already running");
         return Ok(());
     }
@@ -32,7 +34,7 @@ pub async fn start_usage_api_server() -> Result<(), String> {
         .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
 
     let (tx, mut rx) = watch::channel(());
-    let app = create_app();
+    let app = create_app(state);
 
     let handle = tokio::spawn(async move {
         let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -43,21 +45,21 @@ pub async fn start_usage_api_server() -> Result<(), String> {
         }
     });
 
-    state.handle = Some(handle);
-    state.shutdown_tx = Some(tx);
+    server_state.handle = Some(handle);
+    server_state.shutdown_tx = Some(tx);
 
     log::info!("INFO: Usage API server started on {}", addr);
     Ok(())
 }
 
 pub async fn stop_usage_api_server() {
-    let mut state = SERVER_STATE.lock().await;
+    let mut server_state = SERVER_STATE.lock().await;
 
-    if let Some(tx) = state.shutdown_tx.take() {
+    if let Some(tx) = server_state.shutdown_tx.take() {
         let _ = tx.send(());
     }
 
-    if let Some(handle) = state.handle.take() {
+    if let Some(handle) = server_state.handle.take() {
         let _ = handle.await;
     }
 
@@ -94,7 +96,8 @@ mod tests {
     async fn test_server_starts() {
         stop_usage_api_server().await;
 
-        start_usage_api_server()
+        let app_state = AppState::new(Arc::new(crate::database::Database::memory().unwrap()));
+        start_usage_api_server(app_state)
             .await
             .expect("server should start");
 
@@ -119,7 +122,8 @@ mod tests {
     async fn test_server_shutdown() {
         stop_usage_api_server().await;
 
-        start_usage_api_server()
+        let app_state = AppState::new(Arc::new(crate::database::Database::memory().unwrap()));
+        start_usage_api_server(app_state)
             .await
             .expect("server should start");
 

@@ -1,8 +1,11 @@
-use axum::{Json, Router, http::StatusCode};
+use axum::{Json, Router, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use crate::commands::CopilotAuthState;
+use crate::store::AppState;
 
 /// 内部用量结果（query_provider_usage_inner 返回）
 #[derive(Debug, Clone)]
@@ -52,18 +55,112 @@ impl From<UsageResult> for ProviderUsageDto {
 
 pub type QueryResult = Result<Vec<ProviderUsageDto>, String>;
 pub type QueryFuture = Pin<Box<dyn Future<Output = QueryResult> + Send>>;
-pub type QueryFn = Arc<dyn Fn() -> QueryFuture + Send + Sync>;
+pub type QueryFn = Arc<dyn Fn(AppState) -> QueryFuture + Send + Sync>;
+
+/// 全局 Copilot 认证状态（供 Usage API 独立进程使用）
+static USAGE_COPILOT_AUTH: std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::proxy::providers::copilot_auth::CopilotAuthManager>>> =
+    std::sync::OnceLock::new();
+
+/// 初始化 Usage API 所需的 Copilot 认证状态
+pub fn init_usage_copilot_auth(
+    auth: Arc<tokio::sync::RwLock<crate::proxy::providers::copilot_auth::CopilotAuthManager>>,
+) {
+    let _ = USAGE_COPILOT_AUTH.set(auth);
+}
 
 /// 默认的 query_provider_usage_inner 实现。
-/// 生产环境遍历 enabled provider 实时查询用量并映射为 DTO。
-pub async fn default_query_provider_usage_inner() -> QueryResult {
-    // 生产逻辑：查询 SQLite enabled=1 的 providers，逐个查用量，映射为 DTO
-    Ok(vec![])
+/// 生产逻辑：遍历所有 app_type 的 enabled provider，逐个查用量，映射为 DTO。
+pub async fn default_query_provider_usage_inner(state: AppState) -> QueryResult {
+    let mut results = Vec::new();
+
+    // 预创建 dummy CopilotAuthState（非 Copilot provider 不会实际使用）
+    let dummy_copilot = CopilotAuthState(Arc::new(tokio::sync::RwLock::new(
+        crate::proxy::providers::copilot_auth::CopilotAuthManager::new(std::path::PathBuf::new()),
+    )));
+
+    for app_type in crate::app_config::AppType::all() {
+        let providers = match state.db.get_all_providers(app_type.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to get providers for {}: {e}", app_type.as_str());
+                continue;
+            }
+        };
+
+        for (provider_id, provider) in providers {
+            // 只查询启用了 usage_script 的 provider
+            if !provider.has_usage_script_enabled() {
+                continue;
+            }
+
+            let template_type = provider
+                .meta
+                .as_ref()
+                .and_then(|m| m.usage_script.as_ref())
+                .and_then(|s| s.template_type.as_deref())
+                .unwrap_or("");
+
+            let is_copilot = template_type == "github_copilot";
+
+            let copilot_state_ref = if is_copilot {
+                match USAGE_COPILOT_AUTH.get() {
+                    Some(auth) => CopilotAuthState(auth.clone()),
+                    None => {
+                        log::warn!(
+                            "Copilot auth not initialized, skipping provider {}",
+                            provider_id
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                dummy_copilot.clone()
+            };
+
+            match crate::commands::query_provider_usage_inner(
+                &state,
+                &copilot_state_ref,
+                app_type.clone(),
+                &provider_id,
+            )
+            .await
+            {
+                Ok(usage_result) => {
+                    if usage_result.success {
+                        if let Some(data) = usage_result.data {
+                            if let Some(first) = data.first() {
+                                results.push(ProviderUsageDto {
+                                    provider: provider_id,
+                                    remaining_5h: first.remaining.unwrap_or(0.0),
+                                    remaining_weekly: first.total.unwrap_or(0.0),
+                                    unit: first.unit.clone().unwrap_or_default(),
+                                    updated_at: chrono::Local::now().to_rfc3339(),
+                                });
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "Usage query returned failure for provider {}: {:?}",
+                            provider_id,
+                            usage_result.error
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to query usage for provider {}: {e}", provider_id);
+                }
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Handler：实时查询并返回所有 enabled provider 的用量 JSON。
-pub async fn get_providers_usage() -> Result<Json<Vec<ProviderUsageDto>>, (StatusCode, Json<serde_json::Value>)> {
-    match query_provider_usage_inner().await {
+pub async fn get_providers_usage(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ProviderUsageDto>>, (StatusCode, Json<serde_json::Value>)> {
+    match query_provider_usage_inner(state).await {
         Ok(dtos) => Ok(Json(dtos)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,15 +170,15 @@ pub async fn get_providers_usage() -> Result<Json<Vec<ProviderUsageDto>>, (Statu
 }
 
 /// 可被测试覆盖的 inner 查询入口。
-async fn query_provider_usage_inner() -> QueryResult {
+async fn query_provider_usage_inner(state: AppState) -> QueryResult {
     #[cfg(not(test))]
     {
-        default_query_provider_usage_inner().await
+        default_query_provider_usage_inner(state).await
     }
     #[cfg(test)]
     {
         let f = test_infrastructure::QUERY_FN.read().await.clone();
-        f().await
+        f(state).await
     }
 }
 
@@ -92,7 +189,7 @@ mod test_infrastructure {
     use tokio::sync::RwLock;
 
     pub static QUERY_FN: Lazy<RwLock<QueryFn>> = Lazy::new(|| {
-        RwLock::new(Arc::new(|| Box::pin(super::default_query_provider_usage_inner())))
+        RwLock::new(Arc::new(|state| Box::pin(super::default_query_provider_usage_inner(state))))
     });
 
     pub async fn set_query_fn(f: QueryFn) {
@@ -102,14 +199,20 @@ mod test_infrastructure {
 }
 
 /// 注册用量相关路由
-pub fn usage_routes() -> Router {
-    Router::new().route("/providers", axum::routing::get(get_providers_usage))
+pub fn usage_routes(state: AppState) -> Router {
+    Router::new()
+        .route("/providers", axum::routing::get(get_providers_usage))
+        .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn test_app_state() -> AppState {
+        AppState::new(Arc::new(crate::database::Database::memory().unwrap()))
+    }
 
     #[test]
     fn test_dto_serialize() {
@@ -138,7 +241,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_handler_success() {
-        test_infrastructure::set_query_fn(Arc::new(|| {
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
             Box::pin(async {
                 Ok(vec![
                     ProviderUsageDto {
@@ -160,7 +264,7 @@ mod tests {
         }))
         .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert_eq!(dtos.len(), 2);
@@ -174,37 +278,53 @@ mod tests {
         assert_eq!(dtos[1].unit, "USD");
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_handler_query_error() {
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(async { Err("db connection failed".to_string()) })))
-            .await;
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
+            Box::pin(async { Err("db connection failed".to_string()) })
+        }))
+        .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_err());
         let (status, Json(body)) = result.unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"], "db connection failed");
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_handler_empty() {
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(async { Ok(vec![]) }))).await;
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
+            Box::pin(async { Ok(vec![]) })
+        }))
+        .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert!(dtos.is_empty());
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     // ---- DTO mapping boundary tests ----
@@ -273,7 +393,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_handler_boundary_zero() {
-        test_infrastructure::set_query_fn(Arc::new(|| {
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
             Box::pin(async {
                 Ok(vec![ProviderUsageDto {
                     provider: "copilot".to_string(),
@@ -286,7 +407,7 @@ mod tests {
         }))
         .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert_eq!(dtos.len(), 1);
@@ -299,13 +420,17 @@ mod tests {
         assert!(json.contains("\"remaining_weekly\":0"));
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_handler_boundary_negative() {
-        test_infrastructure::set_query_fn(Arc::new(|| {
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
             Box::pin(async {
                 Ok(vec![ProviderUsageDto {
                     provider: "deepseek".to_string(),
@@ -318,7 +443,7 @@ mod tests {
         }))
         .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert_eq!(dtos[0].remaining_5h, -1.0);
@@ -330,14 +455,18 @@ mod tests {
         assert!(json.contains("\"remaining_weekly\":-1"));
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_handler_boundary_large() {
         let large = i64::MAX as f64;
-        test_infrastructure::set_query_fn(Arc::new(move || {
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(move |_state| {
             let val = large;
             Box::pin(async move {
                 Ok(vec![ProviderUsageDto {
@@ -351,7 +480,7 @@ mod tests {
         }))
         .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert_eq!(dtos[0].remaining_5h, large);
@@ -365,13 +494,17 @@ mod tests {
         assert!(!json.contains("Infinity"));
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 
     #[tokio::test]
     #[serial]
     async fn test_handler_empty_provider() {
-        test_infrastructure::set_query_fn(Arc::new(|| {
+        let app_state = test_app_state();
+        test_infrastructure::set_query_fn(Arc::new(|_state| {
             Box::pin(async {
                 Ok(vec![ProviderUsageDto {
                     provider: "".to_string(),
@@ -384,7 +517,7 @@ mod tests {
         }))
         .await;
 
-        let result = get_providers_usage().await;
+        let result = get_providers_usage(axum::extract::State(app_state)).await;
         assert!(result.is_ok());
         let Json(dtos) = result.unwrap();
         assert_eq!(dtos[0].provider, "");
@@ -394,6 +527,9 @@ mod tests {
         assert!(json.contains("\"provider\":\"\""));
 
         // 恢复默认
-        test_infrastructure::set_query_fn(Arc::new(|| Box::pin(default_query_provider_usage_inner()))).await;
+        test_infrastructure::set_query_fn(Arc::new(|state| {
+            Box::pin(default_query_provider_usage_inner(state))
+        }))
+        .await;
     }
 }
