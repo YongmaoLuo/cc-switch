@@ -487,7 +487,20 @@ impl ProxyService {
 
         // 5. 启动代理服务器
         match self.start().await {
-            Ok(info) => Ok(info),
+            Ok(info) => {
+                // 5a) 同步所有 app 的 enabled=true。
+                // 原因：get_proxy_takeover_status()（被 UI 轮询）只读 DB 里的 enabled
+                // 标志，不读 in-memory server 状态。如果只 start() 但不更新 DB，
+                // UI 上的开关会停留在 OFF，即使代理实际上已经在跑。同时这也让
+                // restore_proxy_state_on_startup 能在下次重启时识别并自动接管。
+                // 失败不影响主流程（代理已经跑起来），仅记录 warn。
+                if let Err(e) = self.set_all_apps_takeover_enabled(true).await {
+                    log::warn!(
+                        "设置所有 app 的 enabled=true 失败（UI 状态可能短暂不一致，下一次重启不会自动接管）: {e}"
+                    );
+                }
+                Ok(info)
+            }
             Err(e) => {
                 // 启动失败，恢复原始配置
                 log::error!("代理启动失败，尝试恢复原始配置: {e}");
@@ -495,6 +508,9 @@ impl ProxyService {
                     Ok(()) => {
                         let _ = self.db.set_live_takeover_active(false).await;
                         let _ = self.db.delete_all_live_backups().await;
+                        // 同步把 enabled 清回去（和 start 成功时对称），保证 UI 不显示
+                        // "已开启" 但代理其实没在跑的矛盾状态
+                        let _ = self.set_all_apps_takeover_enabled(false).await;
                     }
                     Err(restore_err) => {
                         log::error!("恢复原始配置失败，将保留备份以便下次启动恢复: {restore_err}");
@@ -503,6 +519,30 @@ impl ProxyService {
                 Err(e)
             }
         }
+    }
+
+    /// 同步设置所有 app 的 enabled 标志
+    ///
+    /// UI 上的代理开关状态（ProxyToggle.tsx）直接读 `proxy_config.enabled` 字段；
+    /// `start_with_takeover`/`stop_with_restore` 必须保证这个字段与代理的运行状态
+    /// 一致，否则会出现"代理实际在跑但 UI 开关显示 OFF"（或反向）的不一致。
+    async fn set_all_apps_takeover_enabled(&self, enabled: bool) -> Result<(), String> {
+        for app_type in ["claude", "codex", "gemini"] {
+            let mut config = self
+                .db
+                .get_proxy_config_for_app(app_type)
+                .await
+                .map_err(|e| format!("获取 {app_type} proxy config 失败: {e}"))?;
+            if config.enabled != enabled {
+                config.enabled = enabled;
+                self.db
+                    .update_proxy_config_for_app(config)
+                    .await
+                    .map_err(|e| format!("更新 {app_type} proxy config 失败: {e}"))?;
+                log::info!("已设置 {app_type} 的 enabled={enabled}");
+            }
+        }
+        Ok(())
     }
 
     /// 获取各应用的接管状态（是否改写该应用的 Live 配置指向本地代理）
