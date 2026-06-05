@@ -778,7 +778,10 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
         let providers = match app_state.db.get_all_providers(app_type.as_str()) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("[Remote] Failed to get providers for {}: {e}", app_type.as_str());
+                log::warn!(
+                    "[Remote] Failed to get providers for {}: {e}",
+                    app_type.as_str()
+                );
                 continue;
             }
         };

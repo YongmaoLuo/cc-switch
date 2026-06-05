@@ -365,10 +365,7 @@ impl RemoteServer {
                 "/api/providers",
                 axum::routing::get(handlers::get_providers),
             )
-            .route(
-                "/api/usage",
-                axum::routing::get(handlers::get_usage),
-            )
+            .route("/api/usage", axum::routing::get(handlers::get_usage))
             .route(
                 "/api/switch",
                 axum::routing::post(handlers::switch_provider),
@@ -385,7 +382,10 @@ impl RemoteServer {
                 "/api/provider-icons/:name",
                 axum::routing::get(handlers::get_provider_icon),
             )
-            .route("/api/proxy/control", axum::routing::post(handlers::proxy_control))
+            .route(
+                "/api/proxy/control",
+                axum::routing::post(handlers::proxy_control),
+            )
             .route(
                 "/api/proxy/takeover",
                 axum::routing::post(handlers::proxy_takeover),
