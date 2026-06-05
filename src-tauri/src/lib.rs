@@ -901,6 +901,11 @@ pub fn run() {
                 app_state.db.clone(),
                 app.handle().clone(),
             );
+            crate::services::s3_auto_sync::start_worker(
+                app_state.db.clone(),
+                app.handle().clone(),
+            );
+            // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
 
             // 启动 Remote Management HTTP Server
