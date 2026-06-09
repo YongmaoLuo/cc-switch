@@ -752,8 +752,15 @@ pub struct TierUsageDto {
 pub struct ProviderUsageDto {
     pub provider: String,
     pub app_type: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<TierUsageDto>,
-    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// true = 查询成功, false = 查询失败
+    pub success: bool,
+    /// 查询失败时的错误信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// GET /api/usage — 实时查询所有 enabled provider 的官方用量
@@ -823,6 +830,14 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("[Remote] Usage query failed for {}: {e}", provider_id);
+                    results.push(ProviderUsageDto {
+                        provider: provider.name.clone(),
+                        app_type: app_type.as_str().to_string(),
+                        tiers: vec![],
+                        updated_at: None,
+                        success: false,
+                        error: Some(format!("{e}")),
+                    });
                     continue;
                 }
             };
@@ -833,6 +848,14 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
                     provider_id,
                     usage_result.error
                 );
+                results.push(ProviderUsageDto {
+                    provider: provider.name.clone(),
+                    app_type: app_type.as_str().to_string(),
+                    tiers: vec![],
+                    updated_at: None,
+                    success: false,
+                    error: usage_result.error.clone(),
+                });
                 continue;
             }
 
@@ -857,7 +880,9 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
                 provider: provider.name.clone(),
                 app_type: app_type.as_str().to_string(),
                 tiers,
-                updated_at: chrono::Local::now().to_rfc3339(),
+                updated_at: Some(chrono::Local::now().to_rfc3339()),
+                success: true,
+                error: None,
             });
         }
     }
