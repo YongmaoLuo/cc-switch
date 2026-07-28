@@ -360,6 +360,11 @@ export interface Settings {
   // 首选语言（可选，默认中文）
   language?: "en" | "zh" | "zh-TW" | "ja";
 
+  // ===== 远程管理设置 =====
+  remoteEnabled?: boolean;
+  remotePort?: number;
+  remoteTailscaleEnabled?: boolean;
+
   // 主页面显示的应用（默认全部显示）
   visibleApps?: VisibleApps;
 

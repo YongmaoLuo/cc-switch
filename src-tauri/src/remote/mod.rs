@@ -394,6 +394,10 @@ impl RemoteServer {
                 "/api/proxy/failover",
                 axum::routing::post(handlers::proxy_failover),
             )
+            .route(
+                "/api/provider/test",
+                axum::routing::post(handlers::test_provider),
+            )
             .layer(cors)
             .with_state(self.state.clone())
     }

@@ -25,13 +25,14 @@ pub async fn stream_check_provider(
         .get(&provider_id)
         .ok_or_else(|| AppError::Message(format!("供应商 {provider_id} 不存在")))?;
 
-    let auth_override = resolve_copilot_auth_override(provider, &copilot_state).await?;
-    let base_url_override = resolve_copilot_base_url_override(provider, &copilot_state).await?;
+    let auth_override = resolve_copilot_auth_override(provider, copilot_state.inner()).await?;
+    let base_url_override =
+        resolve_copilot_base_url_override(provider, copilot_state.inner()).await?;
     let claude_api_format_override = resolve_claude_api_format_override(
         &app_type,
         provider,
         &config,
-        &copilot_state,
+        copilot_state.inner(),
         auth_override.as_ref(),
     )
     .await?;
@@ -88,14 +89,14 @@ pub async fn stream_check_all_providers(
             }
         }
 
-        let auth_override = resolve_copilot_auth_override(&provider, &copilot_state).await?;
+        let auth_override = resolve_copilot_auth_override(&provider, copilot_state.inner()).await?;
         let base_url_override =
-            resolve_copilot_base_url_override(&provider, &copilot_state).await?;
+            resolve_copilot_base_url_override(&provider, copilot_state.inner()).await?;
         let claude_api_format_override = resolve_claude_api_format_override(
             &app_type,
             &provider,
             &config,
-            &copilot_state,
+            copilot_state.inner(),
             auth_override.as_ref(),
         )
         .await
@@ -162,9 +163,9 @@ pub fn save_stream_check_config(
     state.db.save_stream_check_config(&config)
 }
 
-async fn resolve_copilot_auth_override(
+pub async fn resolve_copilot_auth_override(
     provider: &crate::provider::Provider,
-    copilot_state: &State<'_, CopilotAuthState>,
+    copilot_state: &CopilotAuthState,
 ) -> Result<Option<crate::proxy::providers::AuthInfo>, AppError> {
     let is_copilot = is_copilot_provider(provider);
 
@@ -195,9 +196,9 @@ async fn resolve_copilot_auth_override(
     )))
 }
 
-async fn resolve_copilot_base_url_override(
+pub async fn resolve_copilot_base_url_override(
     provider: &crate::provider::Provider,
-    copilot_state: &State<'_, CopilotAuthState>,
+    copilot_state: &CopilotAuthState,
 ) -> Result<Option<String>, AppError> {
     let is_copilot = is_copilot_provider(provider);
     let is_full_url = provider
@@ -224,7 +225,7 @@ async fn resolve_copilot_base_url_override(
     Ok(Some(endpoint))
 }
 
-fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
+pub fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
     provider
         .meta
         .as_ref()
@@ -238,11 +239,11 @@ fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
             .unwrap_or(false)
 }
 
-async fn resolve_claude_api_format_override(
+pub async fn resolve_claude_api_format_override(
     app_type: &AppType,
     provider: &crate::provider::Provider,
     config: &StreamCheckConfig,
-    copilot_state: &State<'_, CopilotAuthState>,
+    copilot_state: &CopilotAuthState,
     auth_override: Option<&crate::proxy::providers::AuthInfo>,
 ) -> Result<Option<String>, AppError> {
     if *app_type != AppType::Claude {

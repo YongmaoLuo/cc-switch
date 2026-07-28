@@ -45,6 +45,7 @@ import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
 import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { RemoteSettings } from "@/components/settings/RemoteSettings";
 import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
@@ -247,6 +248,10 @@ export function SettingsPage({
                       onChange={handleAutoSave}
                     />
                     <WindowSettings
+                      settings={settings}
+                      onChange={handleAutoSave}
+                    />
+                    <RemoteSettings
                       settings={settings}
                       onChange={handleAutoSave}
                     />

@@ -889,3 +889,162 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
 
     Json(json!({ "providers": results })).into_response()
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestProviderRequest {
+    /// Provider ID
+    pub provider_id: String,
+    /// 应用类型，如 "claude" / "codex" / "gemini"
+    pub app_type: String,
+}
+
+/// POST /api/provider/test — 对单个供应商执行模型连通性测试
+///
+/// 与 UI 点击 "测试模型" 按钮调用 `stream_check_provider` Tauri 命令完全一致：
+/// 复用同一组 helper（resolve_copilot_auth_override / base_url / claude_api_format）
+/// 和 `StreamCheckService::check_with_retry`。返回值也是同一个 `StreamCheckResult`
+/// 结构，便于自动化运维脚本（例如先测一下 P1 可用性再决定是否排到队列头部）。
+///
+/// Body: {"providerId": "p1", "appType": "claude"}
+///
+/// Response: 成功时直接返回 `StreamCheckResult` JSON 字段；
+///           失败时返回 {"success": false, "error": "..."}。
+pub async fn test_provider(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    Json(body): Json<TestProviderRequest>,
+) -> impl IntoResponse {
+    use std::str::FromStr;
+
+    if !state.running.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"success": false, "error": "Server is stopped"})),
+        )
+            .into_response();
+    }
+
+    if body.provider_id.is_empty() {
+        return Json(json!({"success": false, "error": "Missing provider_id"})).into_response();
+    }
+
+    let app_type = match AppType::from_str(&body.app_type) {
+        Ok(t) => t,
+        Err(_) => {
+            return Json(
+                json!({"success": false, "error": format!("无效的应用类型: {}", body.app_type)}),
+            )
+            .into_response();
+        }
+    };
+
+    let app_state = app_state(&state);
+    let copilot_state = state.app_handle.state::<CopilotAuthState>();
+
+    // 与 Tauri 命令 stream_check_provider 完全相同的逻辑路径
+    let config = match app_state.db.get_stream_check_config() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+
+    let providers = match app_state.db.get_all_providers(app_type.as_str()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+
+    let provider = match providers.get(&body.provider_id) {
+        Some(p) => p,
+        None => {
+            return Json(
+                json!({"success": false, "error": format!("供应商 {} 不存在", body.provider_id)}),
+            )
+            .into_response();
+        }
+    };
+
+    let auth_override =
+        match commands::resolve_copilot_auth_override(provider, copilot_state.inner()).await {
+            Ok(a) => a,
+            Err(e) => {
+                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            }
+        };
+
+    let base_url_override =
+        match commands::resolve_copilot_base_url_override(provider, copilot_state.inner()).await {
+            Ok(b) => b,
+            Err(e) => {
+                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            }
+        };
+
+    let claude_api_format_override = match commands::resolve_claude_api_format_override(
+        &app_type,
+        provider,
+        &config,
+        copilot_state.inner(),
+        auth_override.as_ref(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+
+    let result = match crate::services::stream_check::StreamCheckService::check_with_retry(
+        &app_type,
+        provider,
+        &config,
+        auth_override,
+        base_url_override,
+        claude_api_format_override,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        }
+    };
+
+    // 复用 Tauri 命令的 stream_check_log 记录
+    let _ = app_state.db.save_stream_check_log(
+        &body.provider_id,
+        &provider.name,
+        app_type.as_str(),
+        &result,
+    );
+
+    let status_str = serde_json::to_string(&result.status)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string();
+
+    log::info!(
+        "[Remote] /api/provider/test {} {} → {} ({}ms)",
+        app_type.as_str(),
+        body.provider_id,
+        status_str,
+        result.response_time_ms.unwrap_or(0)
+    );
+
+    Json(json!({
+        "success": true,
+        "status": status_str,
+        "operational": result.success,
+        "message": result.message,
+        "response_time_ms": result.response_time_ms,
+        "http_status": result.http_status,
+        "model_used": result.model_used,
+        "tested_at": result.tested_at,
+        "retry_count": result.retry_count,
+        "error_category": result.error_category,
+    }))
+    .into_response()
+}
