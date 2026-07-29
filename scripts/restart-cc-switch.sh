@@ -28,7 +28,7 @@ set -euo pipefail
 
 REMOTE_PORT=4000
 PROXY_PORT=15721
-APP_BUNDLE="/Applications/CC Switch.app"
+APP_BUNDLE="${HOME}/Applications/CC Switch.app"
 APP_BINARY="${APP_BUNDLE}/Contents/MacOS/cc-switch"
 SRC_TAURI="/Users/yongmaoluo/Documents/GitHub/cc-switch/src-tauri"
 BUNDLE_APP="${SRC_TAURI}/target/release/bundle/macos/CC Switch.app"
