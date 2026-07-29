@@ -30,6 +30,35 @@ function renderForm(
 }
 
 describe("ClaudeDesktopProviderForm", () => {
+  it.each(["github_copilot", "codex_oauth", "xai_oauth"])(
+    "托管 OAuth %s 即使旧数据是 direct 也强制开启模型映射",
+    (providerType) => {
+      renderForm({
+        name: "Managed OAuth Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.example.com",
+          },
+        },
+        meta: {
+          providerType,
+          claudeDesktopMode: "direct",
+          apiFormat: "anthropic",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "upstream-model" },
+          },
+        },
+      });
+
+      const modelMappingToggle = screen.getByRole("switch", {
+        name: "需要模型映射",
+      });
+      expect(modelMappingToggle).toBeChecked();
+      expect(modelMappingToggle).toBeDisabled();
+    },
+  );
+
   it("编辑模型映射的菜单显示名时保持输入框焦点", () => {
     renderForm({
       name: "Proxy Provider",
@@ -49,7 +78,7 @@ describe("ClaudeDesktopProviderForm", () => {
       },
     });
 
-    // 固定三档（Sonnet / Opus / Haiku）下有三个菜单显示名输入，取 Sonnet（首个）。
+    // 固定四档（Sonnet / Opus / Fable / Haiku）下有四个菜单显示名输入，取 Sonnet（首个）。
     const input = screen.getAllByPlaceholderText(
       "DeepSeek V4 Pro",
     )[0] as HTMLInputElement;
@@ -97,7 +126,7 @@ describe("ClaudeDesktopProviderForm", () => {
     expect(document.activeElement).toBe(currentInput);
   });
 
-  it("代理模式始终渲染 Sonnet / Opus / Haiku 三档（即使只配了一档）", () => {
+  it("代理模式始终渲染 Sonnet / Opus / Fable / Haiku 四档（即使只配了一档）", () => {
     renderForm({
       name: "Proxy Provider",
       settingsConfig: {
@@ -114,13 +143,17 @@ describe("ClaudeDesktopProviderForm", () => {
       },
     });
 
-    // 固定三档：每档各一个「菜单显示名」输入框，无论初始只配了几档。
-    expect(screen.getAllByPlaceholderText("DeepSeek V4 Pro")).toHaveLength(3);
+    // 固定四档：每档各一个「菜单显示名」输入框，无论初始只配了几档。
+    // Haiku 档的占位示例是 "DeepSeek V4 Flash"、其余三档是 "DeepSeek V4 Pro"
+    // （见组件的 role-consistent 占位逻辑），故用正则同时匹配两种占位、数满四档。
+    expect(
+      screen.getAllByPlaceholderText(/DeepSeek V4 (Pro|Flash)/),
+    ).toHaveLength(4);
   });
 
-  it("代理模式初始无路由且默认路由未就绪时不渲染空三档", () => {
+  it("代理模式初始无路由且默认路由未就绪时不渲染空四档", () => {
     // mock 的 getClaudeDesktopDefaultRoutes 返回 []，模拟默认路由尚未就绪。
-    // 修复前：normalizeProxyRows([]) 会渲染 3 条空行并把 routes.length 撑到 3，
+    // 修复前：normalizeProxyRows([]) 会渲染空行并把 routes.length 撑起来，
     // 永久挡住 seed effect 的默认路由回填。修复后应保持空、等待 seed。
     renderForm({
       name: "Proxy Provider",
@@ -139,7 +172,7 @@ describe("ClaudeDesktopProviderForm", () => {
     expect(screen.queryAllByPlaceholderText("DeepSeek V4 Pro")).toHaveLength(0);
   });
 
-  it("保存模型映射时补齐固定三档并把留空档回填为 Sonnet 模型", async () => {
+  it("保存模型映射时补齐固定四档并把留空档回填为 Sonnet 模型", async () => {
     const onSubmit = vi.fn();
     renderForm(
       {
@@ -166,19 +199,25 @@ describe("ClaudeDesktopProviderForm", () => {
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
     const submitted = onSubmit.mock.calls[0][0];
-    // claude-old 迁移到 Sonnet；留空的 Opus / Haiku 回填为 Sonnet 的上游模型，
-    // 保证落库三档齐全，子 agent 调用的 Haiku 始终可解析。
+    // claude-old 迁移到 Sonnet；留空的 Opus / Fable / Haiku 回填为 Sonnet 的
+    // 上游模型，保证落库四档齐全，子 agent 调用的各档始终可解析。
     expect(submitted.meta.claudeDesktopModelRoutes).toMatchObject({
-      "claude-sonnet-4-6": {
+      "claude-sonnet-5": {
         model: "upstream-old",
         labelOverride: "upstream-old",
       },
-      "claude-opus-4-8": { model: "upstream-old" },
+      "claude-opus-5": { model: "upstream-old" },
+      "claude-fable-5": { model: "upstream-old" },
       "claude-haiku-4-5": { model: "upstream-old" },
     });
-    expect(
-      Object.keys(submitted.meta.claudeDesktopModelRoutes).sort(),
-    ).toEqual(["claude-haiku-4-5", "claude-opus-4-8", "claude-sonnet-4-6"]);
+    expect(Object.keys(submitted.meta.claudeDesktopModelRoutes).sort()).toEqual(
+      [
+        "claude-fable-5",
+        "claude-haiku-4-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+      ],
+    );
   });
 
   it("回填空档时继承 Sonnet 的 1M 声明", async () => {
@@ -207,11 +246,11 @@ describe("ClaudeDesktopProviderForm", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
     const routes = onSubmit.mock.calls[0][0].meta.claudeDesktopModelRoutes;
     // 留空的 Opus / Haiku 回填同一上游模型，1M 声明应与 Sonnet 一致。
-    expect(routes["claude-sonnet-4-6"]).toMatchObject({
+    expect(routes["claude-sonnet-5"]).toMatchObject({
       model: "deepseek-v4-pro",
       supports1m: true,
     });
-    expect(routes["claude-opus-4-8"]).toMatchObject({
+    expect(routes["claude-opus-5"]).toMatchObject({
       model: "deepseek-v4-pro",
       supports1m: true,
     });
@@ -249,8 +288,8 @@ describe("ClaudeDesktopProviderForm", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalled());
     const submitted = onSubmit.mock.calls[0][0];
     expect(submitted.meta.claudeDesktopModelRoutes).toMatchObject({
-      "claude-sonnet-4-6": {
-        model: "claude-sonnet-4-6",
+      "claude-sonnet-5": {
+        model: "claude-sonnet-5",
       },
     });
   });

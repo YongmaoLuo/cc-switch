@@ -72,6 +72,7 @@ export function ProxyPanel({
   const { data: claudeQueue = [] } = useFailoverQueue("claude");
   const { data: codexQueue = [] } = useFailoverQueue("codex");
   const { data: geminiQueue = [] } = useFailoverQueue("gemini");
+  const { data: grokQueue = [] } = useFailoverQueue("grokbuild");
 
   const handleTakeoverChange = async (appType: string, enabled: boolean) => {
     try {
@@ -144,6 +145,8 @@ export function ProxyPanel({
         return false;
       }
     };
+    const normalizedAddress =
+      addressTrimmed === "localhost" ? "127.0.0.1" : addressTrimmed;
     const isValidAddress =
       addressTrimmed === "localhost" ||
       addressTrimmed === "0.0.0.0" ||
@@ -181,7 +184,7 @@ export function ProxyPanel({
     try {
       await updateGlobalConfig.mutateAsync({
         ...globalConfig,
-        listenAddress: addressTrimmed,
+        listenAddress: normalizedAddress,
         listenPort: port,
       });
       toast.success(
@@ -270,30 +273,32 @@ export function ProxyPanel({
                     defaultValue: "应用接管",
                   })}
                 </p>
-                <div className="grid gap-2 sm:grid-cols-3">
-                  {(["claude", "codex", "gemini"] as const).map((appType) => {
-                    const isEnabled =
-                      takeoverStatus?.[
-                        appType as keyof typeof takeoverStatus
-                      ] ?? false;
-                    return (
-                      <div
-                        key={appType}
-                        className="flex items-center justify-between rounded-md border border-primary/20 bg-background/60 px-3 py-2"
-                      >
-                        <span className="text-sm font-medium capitalize">
-                          {appType}
-                        </span>
-                        <Switch
-                          checked={isEnabled}
-                          onCheckedChange={(checked) =>
-                            handleTakeoverChange(appType, checked)
-                          }
-                          disabled={setTakeoverForApp.isPending}
-                        />
-                      </div>
-                    );
-                  })}
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  {(["claude", "codex", "gemini", "grokbuild"] as const).map(
+                    (appType) => {
+                      const isEnabled =
+                        takeoverStatus?.[
+                          appType as keyof typeof takeoverStatus
+                        ] ?? false;
+                      return (
+                        <div
+                          key={appType}
+                          className="flex items-center justify-between rounded-md border border-primary/20 bg-background/60 px-3 py-2"
+                        >
+                          <span className="text-sm font-medium capitalize">
+                            {appType === "grokbuild" ? "Grok Build" : appType}
+                          </span>
+                          <Switch
+                            checked={isEnabled}
+                            onCheckedChange={(checked) =>
+                              handleTakeoverChange(appType, checked)
+                            }
+                            disabled={setTakeoverForApp.isPending}
+                          />
+                        </div>
+                      );
+                    },
+                  )}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {t("proxy.takeover.hint", {
@@ -413,7 +418,8 @@ export function ProxyPanel({
               {/* [6] Provider queues */}
               {(claudeQueue.length > 0 ||
                 codexQueue.length > 0 ||
-                geminiQueue.length > 0) && (
+                geminiQueue.length > 0 ||
+                grokQueue.length > 0) && (
                 <div className="pt-3 border-t border-border space-y-3">
                   <div className="flex items-center gap-2">
                     <ListOrdered className="h-3.5 w-3.5 text-muted-foreground" />
@@ -451,6 +457,18 @@ export function ProxyPanel({
                       appType="gemini"
                       appLabel="Gemini"
                       targets={geminiQueue.map((item) => ({
+                        id: item.providerId,
+                        name: item.providerName,
+                      }))}
+                      status={status}
+                    />
+                  )}
+
+                  {grokQueue.length > 0 && (
+                    <ProviderQueueGroup
+                      appType="grokbuild"
+                      appLabel="Grok Build"
+                      targets={grokQueue.map((item) => ({
                         id: item.providerId,
                         name: item.providerName,
                       }))}

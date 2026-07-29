@@ -5,6 +5,7 @@
 pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
 pub mod error_mapper;
@@ -32,6 +33,7 @@ pub(crate) mod switch_lock;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
+pub(crate) mod tool_media;
 pub(crate) mod types;
 pub mod usage;
 
