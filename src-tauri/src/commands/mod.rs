@@ -29,7 +29,7 @@ pub mod skill;
 mod stream_check;
 mod subscription;
 mod sync_support;
-mod xai_oauth;
+pub mod xai_oauth;
 
 mod lightweight;
 mod s3_sync;

@@ -1063,7 +1063,7 @@ impl RequestForwarder {
                                             )
                                             .await
                                         {
-                                            Ok((response, claude_api_format)) => {
+                                            Ok((response, claude_api_format, _outbound_model)) => {
                                                 log::info!(
                                                     "[{app_type_str}] [FALLBACK-OK] MiniMax fallback 成功"
                                                 );
@@ -1097,6 +1097,7 @@ impl RequestForwarder {
                                                     response,
                                                     provider: minimax,
                                                     claude_api_format,
+                                                    outbound_model: None,
                                                     connection_guard: None,
                                                 });
                                             }
@@ -2881,7 +2882,16 @@ async fn check_fallback_provider_quota(provider: &Provider, app_type: &AppType) 
         return false;
     }
 
-    let quota = match crate::services::coding_plan::get_coding_plan_quota(&base_url, &api_key).await
+    let quota = match crate::services::coding_plan::get_coding_plan_quota(
+        &base_url,
+        &api_key,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
     {
         Ok(q) => q,
         Err(e) => {

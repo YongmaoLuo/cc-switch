@@ -30,6 +30,7 @@ mod prompt_files;
 mod provider;
 mod provider_defaults;
 mod proxy;
+mod remote;
 mod services;
 mod session_manager;
 mod settings;
@@ -1087,6 +1088,33 @@ pub fn run() {
             );
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
+
+            // 启动 Remote Management HTTP Server
+            {
+                let app_settings = crate::settings::get_settings();
+                let remote_config = remote::RemoteConfig {
+                    enabled: app_settings.remote_enabled,
+                    port: app_settings.remote_port,
+                    tailscale_enabled: app_settings.remote_tailscale_enabled,
+                };
+
+                // 注入空的 ManagedRemoteServer，供后续命令使用
+                app.manage(remote::ManagedRemoteServer::new(Arc::new(tokio::sync::RwLock::new(None))));
+
+                // 异步启动 remote server（仅当 enabled 时）
+                if remote_config.enabled {
+                    let app_handle = app.handle().clone();
+                    let config = remote_config.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match remote::start_remote(&app_handle, config).await {
+                            Ok(urls) => log::info!("[Remote] Management server started on: {}", urls.join(", ")),
+                            Err(e) => log::warn!("[Remote] Failed to start management server: {e}"),
+                        }
+                    });
+                } else {
+                    log::info!("[Remote] Remote management server disabled");
+                }
+            }
 
             // 初始化 SkillService
             let skill_service = SkillService::new();

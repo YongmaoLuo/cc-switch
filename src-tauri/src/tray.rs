@@ -619,12 +619,11 @@ fn handle_provider_click(
         // 切换供应商。需要本地路由的供应商也不在这里自动启动代理，
         // 由用户在页面/设置中手动开启。
         // 通过 commands::switch_provider 统一入口，包含 SSE 广播
-        crate::commands::switch_provider(
+        let switch_result = tauri::async_runtime::block_on(crate::commands::switch_provider(
             app.clone(),
-            app_state.clone(),
             app_type_str.to_string(),
             provider_id.to_string(),
-        )
+        ))
         .map_err(AppError::Message)?;
 
         // 更新托盘菜单

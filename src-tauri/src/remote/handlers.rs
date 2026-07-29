@@ -4,6 +4,7 @@ use super::html::REMOTE_HTML;
 use super::RemoteState;
 use crate::app_config::AppType;
 use crate::commands::{self, CopilotAuthState};
+use crate::commands::xai_oauth::XaiOAuthState;
 use crate::services::{ProviderService, ProviderSortUpdate};
 use crate::store::AppState;
 use axum::extract::State as AxumState;
@@ -394,9 +395,7 @@ pub async fn get_provider_icon(
         "cohere" => include_str!("../../../src/icons/extracted/cohere.svg"),
         "copilot" => include_str!("../../../src/icons/extracted/copilot.svg"),
         "crazyrouter" => include_str!("../../../src/icons/extracted/crazyrouter.svg"),
-        "ctok" => include_str!("../../../src/icons/extracted/ctok.svg"),
         "cubence" => include_str!("../../../src/icons/extracted/cubence.svg"),
-        "dds" => include_str!("../../../src/icons/extracted/dds.svg"),
         "deepseek" => include_str!("../../../src/icons/extracted/deepseek.svg"),
         "doubao" => include_str!("../../../src/icons/extracted/doubao.svg"),
         "gemini" => include_str!("../../../src/icons/extracted/gemini.svg"),
@@ -778,6 +777,7 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
 
     let app_state = state.app_handle.state::<AppState>();
     let copilot_state = state.app_handle.state::<CopilotAuthState>();
+    let xai_state = state.app_handle.state::<XaiOAuthState>();
 
     let mut results: Vec<ProviderUsageDto> = Vec::new();
 
@@ -821,6 +821,7 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
             let query_result = commands::query_provider_usage_inner(
                 app_state.inner(),
                 copilot_state.inner(),
+                xai_state.inner(),
                 app_type.clone(),
                 &provider_id,
             )
@@ -966,14 +967,6 @@ pub async fn test_provider(
         }
     };
 
-    let auth_override =
-        match commands::resolve_copilot_auth_override(provider, copilot_state.inner()).await {
-            Ok(a) => a,
-            Err(e) => {
-                return Json(json!({"success": false, "error": e.to_string()})).into_response();
-            }
-        };
-
     let base_url_override =
         match commands::resolve_copilot_base_url_override(provider, copilot_state.inner()).await {
             Ok(b) => b,
@@ -982,28 +975,11 @@ pub async fn test_provider(
             }
         };
 
-    let claude_api_format_override = match commands::resolve_claude_api_format_override(
-        &app_type,
-        provider,
-        &config,
-        copilot_state.inner(),
-        auth_override.as_ref(),
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
-        }
-    };
-
     let result = match crate::services::stream_check::StreamCheckService::check_with_retry(
         &app_type,
         provider,
         &config,
-        auth_override,
         base_url_override,
-        claude_api_format_override,
     )
     .await
     {
