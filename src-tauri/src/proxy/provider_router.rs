@@ -247,8 +247,9 @@ impl ProviderRouter {
             return breaker.clone();
         }
 
-        // 从 key 中提取 app_type (格式: "app_type:provider_id")
+        // 从 key 中提取 app_type 和 provider_id (格式: "app_type:provider_id")
         let app_type = key.split(':').next().unwrap_or("claude");
+        let provider_id = key.split(':').nth(1).unwrap_or("");
 
         // 按应用独立读取熔断器配置
         let config = match self.db.get_proxy_config_for_app(app_type).await {
@@ -262,7 +263,17 @@ impl ProviderRouter {
             Err(_) => crate::proxy::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        let breaker = Arc::new(CircuitBreaker::new(config, key.to_string()));
+        // 查询 provider 显示名用于日志可读性。如果查不到（Provider 已被删除），
+        // 回退到 provider_id，让日志至少能定位到具体哪个 provider 出问题。
+        let provider_name = self
+            .db
+            .get_provider_by_id(provider_id, app_type)
+            .ok()
+            .flatten()
+            .map(|p| p.name)
+            .unwrap_or_else(|| provider_id.to_string());
+
+        let breaker = Arc::new(CircuitBreaker::new(config, key.to_string(), provider_name));
         breakers.insert(key.to_string(), breaker.clone());
 
         breaker
