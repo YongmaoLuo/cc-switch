@@ -45,6 +45,7 @@ import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
 import { hermesKeys, useOpenHermesWebUI } from "@/hooks/useHermes";
 import { hermesApi } from "@/lib/api/hermes";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
+import { useProxyEventStream } from "@/hooks/useProxyEventStream";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
@@ -277,6 +278,7 @@ function App() {
     takeoverStatus,
     status: proxyStatus,
   } = useProxyStatus();
+  useProxyEventStream();
   const proxyAppId = isProxyAppId(activeApp) ? activeApp : null;
   const currentAppUsesProxy =
     proxyAppId !== null || activeApp === "claude-desktop";

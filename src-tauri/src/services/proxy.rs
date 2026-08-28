@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
@@ -393,6 +393,9 @@ pub struct ProxyService {
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
     switch_locks: SwitchLockManager,
+    /// SSE 广播通道发送端：用于在状态变更时通知前端 React Query invalidate
+    /// （覆盖"远程 API 改了状态但 UI 不刷新"这个回归问题）
+    sse_tx: Arc<RwLock<Option<broadcast::Sender<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -418,6 +421,7 @@ impl ProxyService {
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
             switch_locks: SwitchLockManager::new(),
+            sse_tx: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -921,6 +925,25 @@ impl ProxyService {
         });
     }
 
+    /// 设置 SSE 广播通道（在 remote server 启动后调用）
+    pub fn set_sse_tx(&self, tx: broadcast::Sender<String>) {
+        futures::executor::block_on(async {
+            *self.sse_tx.write().await = Some(tx);
+        });
+    }
+
+    /// 向前端 SSE 订阅者广播事件（让 UI 主动 invalidate React Query）。
+    /// 这是"控制面 API 改状态 → 数据面 UI 刷新"的关键桥接。
+    fn broadcast_event(&self, event: serde_json::Value) {
+        let tx = self.sse_tx.clone();
+        let event = event.to_string();
+        futures::executor::block_on(async {
+            if let Some(tx) = tx.read().await.as_ref() {
+                let _ = tx.send(event);
+            }
+        });
+    }
+
     pub(crate) async fn lock_switch_for_app(
         &self,
         app_type: &str,
@@ -1092,6 +1115,13 @@ impl ProxyService {
                         "设置所有 app 的 enabled=true 失败（UI 状态可能短暂不一致，下一次重启不会自动接管）: {e}"
                     );
                 }
+                // 5b) 通知前端：代理已启动并接管。让 useProxyEventStream 触发 React Query
+                // invalidate，UI 立即刷新（避免远程 API 改状态后 UI 不显示的回归）。
+                self.broadcast_event(json!({
+                    "type": "proxy_started",
+                    "address": info.address,
+                    "port": info.port,
+                }));
                 Ok(info)
             }
             Err(e) => {
@@ -1136,6 +1166,12 @@ impl ProxyService {
                     .await
                     .map_err(|e| format!("更新 {app_type} proxy config 失败: {e}"))?;
                 log::info!("已设置 {app_type} 的 enabled={enabled}");
+                // 通知前端：接管状态变更，让 useProxyEventStream 触发 invalidate。
+                self.broadcast_event(json!({
+                    "type": "takeover_changed",
+                    "app_type": app_type,
+                    "enabled": enabled,
+                }));
             }
         }
         Ok(())
@@ -1828,6 +1864,8 @@ impl ProxyService {
 
         // 注意：不清除故障转移队列和开关状态，保留供下次开启代理时使用
         log::info!("代理已停止，Live 配置已恢复");
+        // 通知前端：代理已停止并恢复配置，让 useProxyEventStream 触发 invalidate。
+        self.broadcast_event(json!({"type": "proxy_stopped"}));
         Ok(())
     }
 

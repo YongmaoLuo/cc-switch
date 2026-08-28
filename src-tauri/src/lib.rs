@@ -1154,6 +1154,19 @@ pub fn run() {
                             Ok(urls) => log::info!("[Remote] Management server started on: {}", urls.join(", ")),
                             Err(e) => log::warn!("[Remote] Failed to start management server: {e}"),
                         }
+                        // 启动后把 sse_tx 注入 ProxyService，让接管状态变更广播给桌面 app 前端
+                        // （避免远程 API 改状态后 UI 不刷新的回归问题）。
+                        use tauri::Manager;
+                        if let Some(sse_tx) = app_handle
+                            .state::<remote::ManagedRemoteServer>()
+                            .sse_tx()
+                            .await
+                        {
+                            if let Some(state) = app_handle.try_state::<crate::AppState>() {
+                                state.proxy_service.set_sse_tx(sse_tx);
+                                log::info!("[Proxy] SSE tx injected into ProxyService");
+                            }
+                        }
                     });
                 } else {
                     log::info!("[Remote] Remote management server disabled");

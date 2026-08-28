@@ -70,6 +70,12 @@ impl ManagedRemoteServer {
     pub fn lock(&self) -> &Arc<RwLock<Option<RemoteServer>>> {
         &self.0
     }
+
+    /// 获取 sse_tx 广播通道（仅当 server 已启动时返回 Some）
+    pub async fn sse_tx(&self) -> Option<broadcast::Sender<String>> {
+        let guard = self.0.read().await;
+        guard.as_ref().map(|s| s.state().sse_tx.clone())
+    }
 }
 
 /// 获取 Tailscale IPv4 地址
