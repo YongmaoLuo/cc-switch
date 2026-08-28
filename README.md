@@ -594,6 +594,105 @@ pnpm test:unit --coverage
 
 </details>
 
+## RESTful API (YongmaoLuo fork additions)
+
+> **Fork-only:** The remote management server (port `4000`) exposes a small REST + SSE surface for scripting and out-of-band automation. **Upstream `farion1231/cc-switch` does NOT yet officially document or guarantee these endpoints** — they are subject to change. Use at your own risk.
+>
+> Enable the remote server in **Settings → Advanced → Remote Management Server** (default port `4000`). It is local-only by default; turn Tailscale on for remote access.
+>
+> All endpoints return JSON. POST endpoints expect JSON bodies.
+
+### Common curl pattern
+
+```bash
+# Most operations: JSON body
+curl -sS -X POST http://127.0.0.1:4000/api/... \
+  -H 'Content-Type: application/json' \
+  -d '{...}'
+```
+
+### Endpoints
+
+| Method | Path | Body | Purpose |
+|---|---|---|---|
+| `GET` | `/` | — | Mobile-friendly web UI for switching providers |
+| `GET` | `/api/health` | — | Liveness check |
+| `GET` | `/api/current` | — | Current provider of the remote-controlled app |
+| `GET` | `/api/providers` | — | List all providers (id, name, is_current, category, icon) |
+| `GET` | `/api/usage` | — | Usage statistics (per-model token breakdown, costs) |
+| `GET` | `/api/events` | — | **SSE event stream** (see below) |
+| `GET` | `/api/icon` | — | App icon PNG |
+| `GET` | `/api/provider-icons/:name` | — | Provider-specific icon PNG |
+| `POST` | `/api/switch` | `{ "providerId": "..." }` | Switch to a provider by id |
+| `POST` | `/api/reorder` | `{ "movedId": "...", "beforeId": "..." }` | Drag-and-drop reorder (empty `beforeId` = move to end) |
+| `POST` | `/api/provider/test` | `{ "providerId": "...", "appType": "claude" }` | Connectivity test (same as UI "Test" button) |
+| `POST` | `/api/proxy/control` | `{}` (stop) or `{ "start": true }` (start + takeover) | Unified proxy start/stop |
+| `POST` | `/api/proxy/takeover` | `{ "appType": "claude", "enabled": true }` | Per-app takeover toggle |
+| `POST` | `/api/proxy/failover` | `{ "appType": "claude", "enabled": true }` | Auto-failover toggle |
+
+### Examples
+
+```bash
+# Health
+curl -S http://127.0.0.1:4000/api/health
+# → {"status":"ok","version":"1.0.0"}
+
+# List providers
+curl -S http://127.0.0.1:4000/api/providers
+# → {"providers":[{"id":"...","name":"Claude Official","is_current":true,...}]}
+
+# Switch provider
+curl -S -X POST http://127.0.0.1:4000/api/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"providerId":"15bcbddc-4250-4ecf-af3c-bdb21058bda6"}'
+
+# Stop proxy (restores live settings.json, clears enabled flags)
+curl -S -X POST http://127.0.0.1:4000/api/proxy/control
+
+# Start proxy + take over all apps' live settings.json
+curl -S -X POST http://127.0.0.1:4000/api/proxy/control \
+  -H 'Content-Type: application/json' \
+  -d '{"start":true}'
+
+# Toggle single-app takeover
+curl -S -X POST http://127.0.0.1:4000/api/proxy/takeover \
+  -H 'Content-Type: application/json' \
+  -d '{"appType":"claude","enabled":true}'
+```
+
+### SSE event stream (`GET /api/events`)
+
+Long-lived `text/event-stream` connection. The desktop app's `useProxyEventStream` hook subscribes here and invalidates React Query on every event — meaning **state changes triggered by these REST endpoints propagate to the desktop UI without a page reload**.
+
+Browser usage:
+
+```js
+const es = new EventSource('http://127.0.0.1:4000/api/events');
+es.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+  // dispatch on data.type
+};
+```
+
+Event types:
+
+| `type` | When | Payload |
+|---|---|---|
+| `proxy_started` | After `start_with_takeover` succeeds | `{ address, port }` |
+| `proxy_stopped` | After `stop_with_restore` succeeds | `{}` |
+| `takeover_changed` | Per-app `enabled` flag changes | `{ app_type, enabled }` |
+| `live_configs_changed` | Live config takeover / restore | `{}` |
+| `switch` | Provider switch via REST | `{ provider_id, name }` |
+| `shutdown` | Remote server stopping | `{}` |
+
+The connection auto-reconnects on disconnect and heartbeats every 30 s (`event: ping`).
+
+### Notes
+
+- These endpoints require the remote server to be enabled. Disabled by default in some configurations.
+- CORS is `Any` (permissive).) — bound to `127.0.0.1` by default; turn Tailscale on for remote access.
+- Errors return `{ "error": "..."` with appropriate HTTP status (503 if server stopped, 422/4xx on bad body, 5xx on internal failure).
+
 ## Contributing
 
 Issues and suggestions are welcome!
