@@ -25,9 +25,11 @@ English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_
 <details open>
 <summary>Click to collapse</summary>
 
-[![Kimi K2.7 Code](https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-en.png)](https://platform.kimi.ai?aff=cc-switch)
+[![Kimi K2.7 Code](https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-en.png)](https://platform.kimi.ai?track_id=track-20d65732f0aa45dcb1df9691a15610af&aff=cc-switch)
 
-Kimi K3 is Moonshot AI's most capable model and the world's first open 3T-class model. With 2.8 trillion parameters, native vision, and a 1-million-token context window, K3 delivers frontier performance across long-horizon coding, knowledge work, and reasoning. CC Switch makes it easy to configure and switch to Kimi across agentic tools. **[Click here to start using Kimi](https://platform.kimi.ai?aff=cc-switch)**
+Kimi K3 is Moonshot AI's most capable model and the world's first open 3T-class model. With 2.8 trillion parameters, native vision, and a 1-million-token context window, K3 delivers frontier performance across long-horizon coding, knowledge work, and reasoning. CC Switch makes it easy to configure and switch to Kimi across agentic tools. **[Click here to start using Kimi](https://platform.kimi.ai?track_id=track-20d65732f0aa45dcb1df9691a15610af&aff=cc-switch)**
+
+**New user top-up bonus**: register via [this link](https://platform.kimi.ai?track_id=track-20d65732f0aa45dcb1df9691a15610af&aff=cc-switch) and complete your first top-up to receive 10% of the amount as bonus API credit, up to CNY ¥1,000.
 
 Doing mostly coding work? Try the **[Kimi Code subscription](https://www.kimi.com/code/?aff=cc-switch)**.
 
@@ -64,17 +66,12 @@ Register now via <a href="https://pateway.ai/?ch=etzpm8&aff=WB6M6F67#/">this lin
 
 <tr>
 <td width="180"><a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=P9MR3D3PLCNL"><img src="assets/partners/logos/fenno-banner.png" alt="Fenno.ai" width="150"></a></td>
-<td>Thanks to Fenno.ai for sponsoring this project! Fenno.ai is a stable and efficient API relay service provider, currently focused on Codex relay. It is compatible with the OpenAI and Anthropic protocols and can be flexibly used from Codex, Claude Code, OpenCode, and other mainstream coding tools. It reliably supports enterprise-grade workloads of hundreds of billions of tokens per day, with corporate (B2B) settlement and invoicing for both domestic and overseas entities. Fenno.ai offers an exclusive benefit for CC Switch users: subscribe via <a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=P9MR3D3PLCNL">this link</a> to the incredible ¥9.9 Coding Plan worth $150 in credits, and earn up to 20% in referral rewards — invite more, earn more!</td>
+<td>Thanks to Fenno.ai for sponsoring this project! Fenno.ai is a stable and efficient API relay service provider, currently focused on Codex relay. It is compatible with the OpenAI and Anthropic protocols and can be flexibly used from Codex, Claude Code, OpenCode, and other mainstream coding tools. It reliably supports enterprise-grade workloads of hundreds of billions of tokens per day, with corporate (B2B) settlement and invoicing for both domestic and overseas entities. Fenno.ai offers an exclusive benefit for CC Switch users: subscribe via <a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=P9MR3D3PLCNL">this link</a> to the $1.99 Trial Plan worth $50 in credits (valid for 7 days), and earn up to 20% in referral rewards — invite more, earn more!</td>
 </tr>
 
 <tr>
-<td width="180"><a href="https://runapi.co/register?aff=iOKB"><img src="assets/partners/logos/runapi.jpg" alt="RunAPI" width="150"></a></td>
-<td>Thanks to RunAPI for sponsoring this project! RunAPI is a high-performance and reliable AI model API gateway — one API key gives you access to 150+ mainstream models including OpenAI, Claude, Gemini, DeepSeek, and Grok, with prices as low as 10% of the official rate and excellent stability. It works seamlessly with Claude Code, OpenClaw, and other tools. Exclusive benefit for CC Switch users: register via <a href="https://runapi.co/register?aff=iOKB">this link</a> and enjoy a 10% discount on your first top-up!</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://unity2.ai/register?source=ccs"><img src="assets/partners/logos/unity2.jpg" alt="Unity2.ai" width="150"></a></td>
-<td>Thanks to Unity2.ai for sponsoring this project! Unity2.ai is a high-performance AI model API relay platform for individual developers, teams, and enterprises. Long trusted by leading companies in China, it serves over 30 billion tokens per day and supports high concurrency at the 5,000 RPM level. It offers balance-based billing, first top-up bonuses, bundle subscriptions, corporate invoicing, and dedicated support. Register via <a href="https://unity2.ai/register?source=ccs">this link</a> to get $2 in credits, plus another $10 for joining the official group — up to $12 in free credits!</td>
+<td width="180"><a href="https://runapi.host/register?aff=iOKB"><img src="assets/partners/logos/runapi.jpg" alt="RunAPI" width="150"></a></td>
+<td>Thanks to RunAPI for sponsoring this project! RunAPI is a high-performance and reliable AI model API gateway — one API key gives you access to 150+ mainstream models including OpenAI, Claude, Gemini, DeepSeek, and Grok, with prices as low as 10% of the official rate and excellent stability. It works seamlessly with Claude Code, OpenClaw, and other tools. Exclusive benefit for CC Switch users: register via <a href="https://runapi.host/register?aff=iOKB">this link</a> and enjoy a 10% discount on your first top-up!</td>
 </tr>
 
 <tr>
@@ -83,8 +80,8 @@ Register now via <a href="https://pateway.ai/?ch=etzpm8&aff=WB6M6F67#/">this lin
 </tr>
 
 <tr>
-<td width="180"><a href="https://aigocode.com/invite/CC-SWITCH"><img src="assets/partners/logos/aigocode.png" alt="AIGoCode" width="150"></a></td>
-<td>Thanks to AIGoCode for sponsoring this project! AIGoCode is an all-in-one platform that integrates Claude Code, Codex, and the latest Gemini models, providing you with stable, efficient, and highly cost-effective AI coding services. The platform offers flexible subscription plans, zero risk of account suspension, direct access with no VPN required, and lightning-fast responses. AIGoCode has prepared a special benefit for CC Switch users: if you register via <a href="https://aigocode.com/invite/CC-SWITCH">this link</a>, you'll receive an extra 10% bonus credit on your first top-up!</td>
+<td width="180"><a href="https://aigocode.app/invite/CC-SWITCH"><img src="assets/partners/logos/aigocode.png" alt="AIGoCode" width="150"></a></td>
+<td>Thanks to AIGoCode for sponsoring this project! AIGoCode is an all-in-one platform that integrates Claude Code, Codex, and the latest Gemini models, providing you with stable, efficient, and highly cost-effective AI coding services. The platform offers flexible subscription plans, zero risk of account suspension, direct access with no VPN required, and lightning-fast responses. AIGoCode has prepared a special benefit for CC Switch users: if you register via <a href="https://aigocode.app/invite/CC-SWITCH">this link</a>, you'll receive an extra 10% bonus credit on your first top-up!</td>
 </tr>
 
 <tr>
@@ -113,10 +110,15 @@ Register now via <a href="https://pateway.ai/?ch=etzpm8&aff=WB6M6F67#/">this lin
 </tr>
 
 <tr>
-<td width="180"><a href="https://teamorouter.com/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory"><img src="assets/partners/logos/TeamoRouter-banner.png" alt="TeamoRouter" width="150"></a></td>
+<td width="180"><a href="https://teamorouter.cn/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory"><img src="assets/partners/logos/TeamoRouter-banner.png" alt="TeamoRouter" width="150"></a></td>
 <td>Thanks to TeamoRouter for sponsoring this project! TeamoRouter is an enterprise-grade Agentic LLM gateway built for developers, AI teams, and businesses. Without requiring any subscriptions, it lets you access Claude Code, Codex, Gemini CLI, OpenAI Codex, and other popular AI agents through a single unified API, while offering API pricing at discounts of up to 90%.
 Unlike typical API relay services, TeamoRouter aggregates hundreds of official model providers and trusted infrastructure partners, including OpenAI, Anthropic, Vertex, Azure, and AWS bedrock. Every provider is verified for 100% Agent protocol compatibility, cache performance, and request traceability, ensuring stable quality instead of reverse-engineered or diluted endpoints. The platform delivers near-official TTFT, 99.6% SLA, enterprise-scale throughput up to 5,000 QPM, and industry-leading cache hit rates that dramatically reduce token costs for long-running agent workflows.
-TeamoRouter also offers enterprise features including centralized billing, team management, BYOK, smart routing, usage analytics, dynamic provider optimization, and dedicated support. For an even simpler experience, Teamo Desktop lets you use Claude Code, Codex, Gemini CLI, and other popular AI agents with one-click setup—no API key management or manual gateway configuration required. Register via <a href="https://teamorouter.com/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory">this link</a> as a new user to receive 10% off your first top-up.</td>
+TeamoRouter also offers enterprise features including centralized billing, team management, BYOK, smart routing, usage analytics, dynamic provider optimization, and dedicated support. For an even simpler experience, Teamo Desktop lets you use Claude Code, Codex, Gemini CLI, and other popular AI agents with one-click setup—no API key management or manual gateway configuration required. Register via <a href="https://teamorouter.cn/?utm_source=cc_switch&utm_medium=referral&utm_campaign=ai_directory">this link</a> as a new user to receive 10% off your first top-up.</td>
+</tr>
+
+<tr>
+<td width="180"><a href="https://ppio.com/activity/ccswitch"><img src="assets/partners/logos/ppio-banner.png" alt="PPIO" width="150"></a></td>
+<td>Thanks to PPIO for sponsoring this project! PPIO is a leading independent Agentic Cloud provider in China, co-founded in 2018 by PPTV founder Yao Xin and former PPTV chief architect Wang Wenyu. A single API key gives you access to every flagship open-source model, including DeepSeek-V4-Flash, Kimi-K3, GLM-5.2, and MiniMax-M3; the enterprise Token Plan is available at up to 40% off and supports 200 seats, and the Fusion blended model matches Fable5 at one-tenth of the price. Register via <a href="https://ppio.com/activity/ccswitch">this link</a> and complete identity verification to receive a ¥10 credit voucher — invite friends to top up and earn up to 15% cashback on their spend.</td>
 </tr>
 
 <tr>
@@ -140,8 +142,8 @@ TeamoRouter also offers enterprise features including centralized billing, team 
 </tr>
 
 <tr>
-<td width="180"><a href="https://nekocode.ai?aff=CCSWITCH"><img src="assets/partners/logos/nekocode-banner.png" alt="NekoCode" width="150"></a></td>
-<td>Thanks to <a href="https://nekocode.ai?aff=CCSWITCH">NekoCode</a> for sponsoring this project! NekoCode provides developers with a stable, efficient, and reliable API relay service for Claude, Codex, and other AI models. With transparent pricing and flexible pay-as-you-go billing, it offers a simple and cost-effective way to access AI models. CC Switch users can enjoy an exclusive 10% discount: register via <a href="https://nekocode.ai?aff=CCSWITCH">this link</a> and enter promo code <code>cc-switch</code> during recharge to receive 10% off your top-up!</td>
+<td width="180"><a href="https://a6api.com/register?aff=AqNr"><img src="assets/partners/logos/a6-banner-en.jpg" alt="A6API" width="150"></a></td>
+<td>Thanks to <a href="https://a6api.com/register?aff=AqNr">A6API</a> for sponsoring this project! A6API is a one-stop AI model API aggregation platform covering Claude, GPT, Gemini, Codex, and other mainstream models. Multiple vendors can list their supply on the platform, so the same model can be quoted competitively by several upstream providers. Smart routing automatically picks the more stable, lower-priced route available and fails over automatically, helping you reduce failed requests, cut costs, and improve stability. Whether you are an individual developer, an AI product team, or a studio, you can integrate quickly through a unified interface — compatible with all formats, with low migration cost. New users who register via <a href="https://a6api.com/register?aff=AqNr">this link</a> receive free trial credits: try it first, then use it at a low price.</td>
 </tr>
 
 <tr>
