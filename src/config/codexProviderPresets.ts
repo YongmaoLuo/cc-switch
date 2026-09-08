@@ -496,6 +496,26 @@ requires_openai_auth = true`,
     icon: "apikeyfun",
   },
   {
+    name: "9527CODE",
+    websiteUrl: "https://9527.codes",
+    apiKeyUrl: "https://9527.codes/register?aff=e5zI",
+    category: "aggregator",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "9527code",
+      "https://9527.codes/v1",
+      "gpt-5.6-sol",
+    ),
+    endpointCandidates: [
+      "https://9527.codes/v1",
+      "https://api.9527.codes/v1",
+      "https://cdn.9527.codes/v1",
+    ],
+    isPartner: true,
+    partnerPromotionKey: "9527code",
+    icon: "9527code",
+  },
+  {
     name: "Code0",
     websiteUrl: "https://code0.ai",
     apiKeyUrl: "https://code0.ai/agent/register/B2XHxGjGmRvqgznY",
@@ -899,6 +919,22 @@ requires_openai_auth = true`,
     iconColor: "#000000",
   },
   {
+    name: "SoleAPI",
+    websiteUrl: "https://soleapi.com",
+    apiKeyUrl: "https://soleapi.com/r/ccswitch",
+    category: "aggregator",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig(
+      "soleapi",
+      "https://soleapi.com/v1",
+      "gpt-5.6-sol",
+    ),
+    endpointCandidates: ["https://soleapi.com/v1"],
+    isPartner: true,
+    partnerPromotionKey: "soleapi",
+    icon: "soleapi",
+  },
+  {
     name: "Micu",
     websiteUrl: "https://www.micuapi.ai",
     apiKeyUrl: "https://www.micuapi.ai/register?aff=aOYQ",
@@ -1152,32 +1188,45 @@ requires_openai_auth = true`,
     websiteUrl: "https://open.bigmodel.cn",
     apiKeyUrl: "https://www.bigmodel.cn/claude-code?ic=RRVJPB5SII",
     auth: generateThirdPartyAuth(""),
+    // 智谱三端点分立（docs.bigmodel.cn/cn/coding-plan/tool/others）：Anthropic
+    // /api/anthropic、OpenAI Chat /api/coding/paas/v4、OpenAI Responses /api/v1，
+    // 并明示「错误配置端点将导致无法使用 GLM Coding Plan 套餐额度」。Codex 直连
+    // 发的是 Responses wire，base_url 必须是 /api/v1；Chat 端点上的 /responses
+    // 是严格旧网关（拒 type=custom 工具 → #6944 的 400）
     config: generateThirdPartyConfig(
       "zhipu_glm",
-      "https://open.bigmodel.cn/api/coding/paas/v4",
-      "glm-5.2",
+      "https://open.bigmodel.cn/api/v1",
+      "glm-5.3",
     ),
-    endpointCandidates: ["https://open.bigmodel.cn/api/coding/paas/v4"],
-    apiFormat: "openai_chat",
+    endpointCandidates: ["https://open.bigmodel.cn/api/v1"],
+    // 官方 Codex 接入页（docs.bigmodel.cn/cn/coding-plan/tool/codex，2026-09-04
+    // 核对）：wire_api=responses 对自家 /api/v1，与 MiMo/MiniMax 同为原生直连
+    // → NativeResponses profile（shell_command 编辑、不发 freeform apply_patch；
+    // 官方目录虽声明 freeform，无真机验证前按保守口径，不引入 400 风险）
+    apiFormat: "openai_responses",
+    // 档位/上下文/模态照抄官方 models.json：glm-5.3 low/high/max 默认 max；
+    // glm-5-turbo 官方档位为空、默认 max——cc-switch 表达不了空档位（回落会得到
+    // 模板 none/high，none 在原生直连下没有转换层兜底、会原样发给严格网关），
+    // 按官方默认收成单档 max。两模型 input_modalities=["text"]、并行工具调用 true
     modelCatalog: modelCatalog([
-      // Chat 路由 supportsEffort:false：档位值不进 wire，none=注入
-      // thinking:{type:"disabled"} 关思考，其余档一律等价于开思考。只暴露真实
-      // 两态；不填的话 gpt5_5 模板默认 low/medium/high/xhigh 全是假差异档，
-      // 且没有 none，用户在 Codex 里反而关不掉思考
       {
-        model: "glm-5.2",
-        displayName: "GLM-5.2",
-        contextWindow: 200000,
-        reasoningLevels: ["none", "high"],
+        model: "glm-5.3",
+        displayName: "GLM-5.3",
+        contextWindow: 1048576,
+        inputModalities: ["text"],
+        supportsParallelToolCalls: true,
+        reasoningLevels: ["low", "high", "max"],
+        defaultReasoningLevel: "max",
+      },
+      {
+        model: "glm-5-turbo",
+        displayName: "GLM-5-Turbo",
+        contextWindow: 204800,
+        inputModalities: ["text"],
+        supportsParallelToolCalls: true,
+        reasoningLevels: ["max"],
       },
     ]),
-    codexChatReasoning: {
-      supportsThinking: true,
-      supportsEffort: false,
-      thinkingParam: "thinking",
-      effortParam: "none",
-      outputFormat: "reasoning_content",
-    },
     category: "cn_official",
     icon: "zhipu",
     iconColor: "#0F62FE",
@@ -1187,32 +1236,26 @@ requires_openai_auth = true`,
     websiteUrl: "https://z.ai",
     apiKeyUrl: "https://z.ai/subscribe?ic=8JVLJQFSKB",
     auth: generateThirdPartyAuth(""),
+    // 国际站同上（docs.z.ai/devpack/tool/others + devpack/tool/codex，2026-09-04
+    // 核对）：Responses 端点 /api/v1，官方 models.json 仅列 glm-5.3
     config: generateThirdPartyConfig(
       "zhipu_glm_en",
-      "https://api.z.ai/api/coding/paas/v4",
-      "glm-5.2",
+      "https://api.z.ai/api/v1",
+      "glm-5.3",
     ),
-    endpointCandidates: ["https://api.z.ai/api/coding/paas/v4"],
-    apiFormat: "openai_chat",
+    endpointCandidates: ["https://api.z.ai/api/v1"],
+    apiFormat: "openai_responses",
     modelCatalog: modelCatalog([
-      // Chat 路由 supportsEffort:false：档位值不进 wire，none=注入
-      // thinking:{type:"disabled"} 关思考，其余档一律等价于开思考。只暴露真实
-      // 两态；不填的话 gpt5_5 模板默认 low/medium/high/xhigh 全是假差异档，
-      // 且没有 none，用户在 Codex 里反而关不掉思考
       {
-        model: "glm-5.2",
-        displayName: "GLM-5.2",
-        contextWindow: 200000,
-        reasoningLevels: ["none", "high"],
+        model: "glm-5.3",
+        displayName: "GLM-5.3",
+        contextWindow: 1048576,
+        inputModalities: ["text"],
+        supportsParallelToolCalls: true,
+        reasoningLevels: ["low", "high", "max"],
+        defaultReasoningLevel: "max",
       },
     ]),
-    codexChatReasoning: {
-      supportsThinking: true,
-      supportsEffort: false,
-      thinkingParam: "thinking",
-      effortParam: "none",
-      outputFormat: "reasoning_content",
-    },
     category: "cn_official",
     icon: "zhipu",
     iconColor: "#0F62FE",
@@ -1583,13 +1626,6 @@ requires_openai_auth = true`,
         reasoningLevels: ["high"],
       },
       {
-        // 不在套餐文档表，/models 收录 + 真 Key 实测可用（2026-08-31）
-        model: "minimax-m2.5",
-        displayName: "MiniMax M2.5",
-        contextWindow: 200000,
-        reasoningLevels: ["high"],
-      },
-      {
         model: "glm-5",
         displayName: "GLM-5",
         contextWindow: 200000,
@@ -1811,13 +1847,6 @@ requires_openai_auth = true`,
         displayName: "MiniMax M3",
         contextWindow: 1048576,
         reasoningLevels: ["none", "high"],
-      },
-      {
-        // 型号列表已除名，真 Key 实测仍可用（2026-08-31）
-        model: "minimax-m2.5",
-        displayName: "MiniMax M2.5",
-        contextWindow: 200000,
-        reasoningLevels: ["high"],
       },
       {
         model: "deepseek-v4-flash",
@@ -2734,5 +2763,21 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
     category: "aggregator",
     icon: "jiekou",
     iconColor: "#000000",
+  },
+  {
+    name: "AICodeWith",
+    websiteUrl: "https://aicodewith.ai",
+    apiKeyUrl: "https://aicodewith.ai/login?tab=register",
+    auth: generateThirdPartyAuth(""),
+    // 官方 Codex 专用端点，不能用通用 /v1（协议不同）
+    config: generateThirdPartyConfig(
+      "aicodewith",
+      "https://api.aicodewith.ai/chatgpt/v1",
+      "gpt-5.6-sol",
+    ),
+    endpointCandidates: ["https://api.aicodewith.ai/chatgpt/v1"],
+    category: "aggregator",
+    icon: "aicodewith",
+    iconColor: "#3A3B40",
   },
 ];

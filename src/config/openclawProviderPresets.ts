@@ -691,6 +691,55 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
     },
   },
   {
+    name: "9527CODE",
+    websiteUrl: "https://9527.codes",
+    apiKeyUrl: "https://9527.codes/register?aff=e5zI",
+    settingsConfig: {
+      baseUrl: "https://9527.codes",
+      apiKey: "",
+      api: "anthropic-messages",
+      models: [
+        {
+          id: "claude-opus-5",
+          name: "Claude Opus 5",
+          contextWindow: 1000000,
+        },
+        {
+          id: "claude-sonnet-5",
+          name: "Claude Sonnet 5",
+          contextWindow: 1000000,
+        },
+        {
+          id: "claude-haiku-4-5",
+          name: "Claude Haiku 4.5",
+          contextWindow: 200000,
+        },
+      ],
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "9527code",
+    icon: "9527code",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+    suggestedDefaults: {
+      model: {
+        primary: "9527code/claude-opus-5",
+        fallbacks: ["9527code/claude-sonnet-5"],
+      },
+      modelCatalog: {
+        "9527code/claude-opus-5": { alias: "Opus" },
+        "9527code/claude-sonnet-5": { alias: "Sonnet" },
+        "9527code/claude-haiku-4-5": { alias: "Haiku" },
+      },
+    },
+  },
+  {
     name: "Code0",
     websiteUrl: "https://code0.ai",
     apiKeyUrl: "https://code0.ai/agent/register/B2XHxGjGmRvqgznY",
@@ -1305,6 +1354,55 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
     },
   },
   {
+    name: "SoleAPI",
+    websiteUrl: "https://soleapi.com",
+    apiKeyUrl: "https://soleapi.com/r/ccswitch",
+    settingsConfig: {
+      baseUrl: "https://soleapi.com",
+      apiKey: "",
+      api: "anthropic-messages",
+      models: [
+        {
+          id: "claude-opus-5",
+          name: "Claude Opus 5",
+          contextWindow: 1000000,
+        },
+        {
+          id: "claude-sonnet-5",
+          name: "Claude Sonnet 5",
+          contextWindow: 1000000,
+        },
+        {
+          id: "claude-haiku-4-5-20251001",
+          name: "Claude Haiku 4.5",
+          contextWindow: 200000,
+        },
+      ],
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "soleapi",
+    icon: "soleapi",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+    suggestedDefaults: {
+      model: {
+        primary: "soleapi/claude-opus-5",
+        fallbacks: ["soleapi/claude-sonnet-5"],
+      },
+      modelCatalog: {
+        "soleapi/claude-opus-5": { alias: "Opus" },
+        "soleapi/claude-sonnet-5": { alias: "Sonnet" },
+        "soleapi/claude-haiku-4-5-20251001": { alias: "Haiku" },
+      },
+    },
+  },
+  {
     name: "Micu",
     websiteUrl: "https://www.micuapi.ai",
     apiKeyUrl: "https://www.micuapi.ai/register?aff=aOYQ",
@@ -1872,15 +1970,6 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
           maxTokens: 131072,
         },
         {
-          id: "minimax-m2.5",
-          name: "MiniMax M2.5",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 196608,
-          maxTokens: 32768,
-        },
-        {
           id: "glm-5",
           name: "GLM-5",
           reasoning: false,
@@ -2053,12 +2142,12 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
   {
     // Token Plan 企业版专业套餐（1823/130659，2026-08-25 版，广州地域）：
     // 模型条目照官方企业版 OpenClaw 接入页（1300/81503，Pro 块）原样
-    //（cost 全零、ctx/maxTokens 为官方 OpenClaw 口径）；glm-5/minimax-m2.5/
-    // deepseek 带日期对取个人版接入页（1823/130062）口径；接入页未列的
+    //（cost 全零、ctx/maxTokens 为官方 OpenClaw 口径）；glm-5/deepseek
+    // 带日期对取个人版接入页（1823/130062）口径；接入页未列的
     // glm-5.3/glm-5.1/glm-5-turbo/kimi-k2.6/minimax-m2.7/deepseek-*-0731/
     // -0813 按平台模型列表页（1300/78934）补 maxTokens、reasoning 随同族
     // 接入页口径（全 false）。kimi-k2.5 官方 2026-08-31 下线不收；
-    // minimax-m2.5 文档已除名但接入页仍列且真 Key 实测可用，照实收录
+    // minimax-m2.5 官方已除名且平台计划下线，2026-09-07 从全部 app 移除
     name: "Tencent Token Plan Enterprise Pro",
     websiteUrl: "https://cloud.tencent.com/product/tokenhub",
     apiKeyUrl: "https://console.cloud.tencent.com/tokenhub/tokenplan-e",
@@ -2169,15 +2258,6 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
           input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 1048576,
-          maxTokens: 32768,
-        },
-        {
-          id: "minimax-m2.5",
-          name: "MiniMax M2.5",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 196608,
           maxTokens: 32768,
         },
         {
@@ -3637,6 +3717,38 @@ export const openclawProviderPresets: OpenClawProviderPreset[] = [
       model: { primary: "jiekou/claude-fable-5" },
       modelCatalog: {
         "jiekou/claude-fable-5": { alias: "Claude Fable 5" },
+      },
+    },
+  },
+  {
+    name: "AICodeWith",
+    websiteUrl: "https://aicodewith.ai",
+    apiKeyUrl: "https://aicodewith.ai/login?tab=register",
+    settingsConfig: {
+      baseUrl: "https://api.aicodewith.ai/chatgpt/v1",
+      apiKey: "",
+      api: "openai-responses",
+      models: [
+        {
+          id: "gpt-5.6-sol",
+          name: "GPT-5.6 Sol",
+        },
+      ],
+    },
+    category: "aggregator",
+    icon: "aicodewith",
+    iconColor: "#3A3B40",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "sk-...",
+        editorValue: "",
+      },
+    },
+    suggestedDefaults: {
+      model: { primary: "aicodewith/gpt-5.6-sol" },
+      modelCatalog: {
+        "aicodewith/gpt-5.6-sol": { alias: "GPT-5.6 Sol" },
       },
     },
   },

@@ -710,6 +710,36 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     },
   },
   {
+    name: "9527CODE",
+    websiteUrl: "https://9527.codes",
+    apiKeyUrl: "https://9527.codes/register?aff=e5zI",
+    settingsConfig: {
+      npm: "@ai-sdk/anthropic",
+      name: "9527CODE",
+      options: {
+        baseURL: "https://9527.codes/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "claude-opus-5": { name: "Claude Opus 5" },
+        "claude-sonnet-5": { name: "Claude Sonnet 5" },
+        "claude-haiku-4-5": { name: "Claude Haiku 4.5" },
+      },
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "9527code",
+    icon: "9527code",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
     name: "Code0",
     websiteUrl: "https://code0.ai",
     apiKeyUrl: "https://code0.ai/agent/register/B2XHxGjGmRvqgznY",
@@ -1065,6 +1095,36 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     partnerPromotionKey: "sssaicode",
     icon: "sssaicode",
     iconColor: "#000000",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
+    name: "SoleAPI",
+    websiteUrl: "https://soleapi.com",
+    apiKeyUrl: "https://soleapi.com/r/ccswitch",
+    settingsConfig: {
+      npm: "@ai-sdk/anthropic",
+      name: "SoleAPI",
+      options: {
+        baseURL: "https://soleapi.com/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "claude-opus-5": { name: "Claude Opus 5" },
+        "claude-sonnet-5": { name: "Claude Sonnet 5" },
+        "claude-haiku-4-5-20251001": { name: "Claude Haiku 4.5" },
+      },
+    },
+    category: "aggregator",
+    isPartner: true,
+    partnerPromotionKey: "soleapi",
+    icon: "soleapi",
     templateValues: {
       apiKey: {
         label: "API Key",
@@ -1476,7 +1536,6 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
         "deepseek-v4-flash-202605": { name: "DeepSeek V4 Flash" },
         "deepseek-v4-pro-202606": { name: "DeepSeek V4 Pro" },
         "minimax-m2.7": { name: "MiniMax M2.7" },
-        "minimax-m2.5": { name: "MiniMax M2.5" },
         "glm-5": { name: "GLM-5" },
         "glm-5.1": { name: "GLM-5.1" },
         "glm-5.2": { name: "GLM-5.2" },
@@ -1568,7 +1627,6 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
         "kimi-k2.6": { name: "Kimi K2.6" },
         "minimax-m2.7": { name: "MiniMax M2.7" },
         "minimax-m3": { name: "MiniMax M3" },
-        "minimax-m2.5": { name: "MiniMax M2.5" },
         "deepseek-v4-flash": { name: "DeepSeek V4 Flash" },
         "deepseek-v4-pro": { name: "DeepSeek V4 Pro" },
         "deepseek-v4-flash-0731": { name: "DeepSeek V4 Flash 0731 GA" },
@@ -2620,6 +2678,34 @@ export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
     category: "aggregator",
     icon: "jiekou",
     iconColor: "#000000",
+    templateValues: {
+      apiKey: {
+        label: "API Key",
+        placeholder: "",
+        editorValue: "",
+      },
+    },
+  },
+  {
+    name: "AICodeWith",
+    websiteUrl: "https://aicodewith.ai",
+    apiKeyUrl: "https://aicodewith.ai/login?tab=register",
+    settingsConfig: {
+      npm: "@ai-sdk/anthropic",
+      name: "AICodeWith",
+      options: {
+        baseURL: "https://api.aicodewith.ai/v1",
+        apiKey: "",
+        setCacheKey: true,
+      },
+      models: {
+        "claude-sonnet-5": { name: "Claude Sonnet 5" },
+        "claude-opus-5": { name: "Claude Opus 5" },
+      },
+    },
+    category: "aggregator",
+    icon: "aicodewith",
+    iconColor: "#3A3B40",
     templateValues: {
       apiKey: {
         label: "API Key",

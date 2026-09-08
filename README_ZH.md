@@ -100,6 +100,11 @@ Claude Code / Codex / Gemini 官方渠道低至 3.8 / 0.2 / 0.9 折，充值更�
 </tr>
 
 <tr>
+<td width="180"><a href="https://9527.codes/register?aff=e5zI"><img src="assets/partners/logos/9527-banner.png" alt="9527CODE" width="150"></a></td>
+<td>感谢 9527CODE 赞助本项目！9527 CODE 是专注于稳定性与服务质量的企业级满血 AI 中转平台，为 Claude Code、Codex 等主流 AI 模型提供高速、稳定、高质量的中转服务。更重视长期稳定、线路质量与持续可用性。面向企业及高强度 AI 用户，提供稳定、高效的一站式模型接入方案。持续运营一年，服务稳定性达 99.9%，提供 7×24 小时人工技术支持。通过本项目<a href="https://9527.codes/register?aff=e5zI">专属链接</a>注册，新人福利联系客服赠送体验额度，拉新返现无上限！</td>
+</tr>
+
+<tr>
 <td width="180"><a href="https://console.apito.ai/agent/register/pQBql2buaqiX3dDS"><img src="assets/partners/logos/claudeapi.png" alt="ClaudeAPI" width="150"></a></td>
 <td>本项目由 <a href="https://console.apito.ai/agent/register/pQBql2buaqiX3dDS">Claude API</a> 赞助。Claude API 直连，三分钟接入 Claude Code 与 Agent 应用 新用户可领取测试额度。基于 Anthropic 官方 Key + AWS Bedrock 官方渠道，非逆向、非降智，支持 Opus / Sonnet / Haiku 全系列模型，保留 Tool Use、1M 上下文等官方能力。适合 Claude Code 深度用户、Agent 工程师与企业技术团队，支持开票和团队对接。点击<a href="https://console.apito.ai/agent/register/pQBql2buaqiX3dDS">这里</a>注册！</td>
 </tr>
@@ -164,6 +169,11 @@ TeamoRouter 还提供企业级功能，包括集中账单、团队管理、BYOK�
 <tr>
 <td width="180"><a href="https://www.sssaicode.com/register?ref=DCP0SM"><img src="assets/partners/logos/sssaicode.png" alt="SSSAiCode" width="150"></a></td>
 <td>感谢 SSSAiCode 赞助了本项目！SSSAiCode 是一家稳定可靠的API中转站，致力于提供稳定、可靠、平价的Claude、CodeX模型服务，支持当日快速开票，SSSAiCode为本软件的用户提供特别优惠，使用<a href="https://www.sssaicode.com/register?ref=DCP0SM">此链接</a>注册每次充值均可享受10$的额外奖励！</td>
+</tr>
+
+<tr>
+<td width="180"><a href="https://soleapi.com/r/ccswitch"><img src="assets/partners/logos/soleapi-banner.png" alt="SoleAPI" width="150"></a></td>
+<td>感谢 SoleAPI 对本项目的支持！SoleAPI 是一个面向开发者与企业的 AI 模型网关，一个 API Key 直达 Claude、GPT、Gemini 等 30+ 主流模型。原生兼容 OpenAI 与 Anthropic 协议，只需替换 Base URL 即可无缝接入 Claude Code、Codex、Cursor 等编码工具与现有 SDK。平台基于延迟与健康度实时智能选路，上游异常毫秒级自动切换备用渠道，服务可用性 99.99%，并提供 7×24 小时技术支持；所有调用一张账单，逐请求的 Token 与费用透明可查。通过本项目<a href="https://soleapi.com/r/ccswitch">专属链接</a>注册即送体验额度，邀请好友充值可持续获得返现奖励！</td>
 </tr>
 
 <tr>
@@ -340,7 +350,7 @@ CC_SWITCH_GDK_BACKEND=wayland ./CC-Switch-*.AppImage
 2. **切换供应商**：
    - 主界面：选择供应商 → 点击"启用"
    - 系统托盘：直接点击供应商名称（立即生效）
-3. **生效方式**：重启终端或对应的 CLI 工具以应用更改（CLaude Code 无需重启）
+3. **生效方式**：重启终端或对应的 CLI 工具以应用更改（Claude Code 无需重启）
 4. **恢复官方登录**：添加"官方登录"预设，重启 CLI 工具后按照其登录/OAuth 流程操作
 
 ### MCP、Prompts、Skills 与会话
@@ -579,7 +589,8 @@ pnpm test:unit --coverage
 │   ├── lib/
 │   │   ├── api/                # Tauri API 封装（类型安全）
 │   │   └── query/              # TanStack Query 配置
-│   ├── locales/                # 翻译 (zh/zh-TW/en/ja)
+│   ├── i18n/                   # 国际化
+│   │   └── locales/            # 翻译 (zh/zh-TW/en/ja)
 │   ├── config/                 # 预设 (providers/mcp)
 │   └── types/                  # TypeScript 类型定义
 ├── src-tauri/                  # 后端 (Rust)
