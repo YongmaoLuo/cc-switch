@@ -135,11 +135,17 @@ impl std::fmt::Debug for HalfOpenPermitGuard {
 
 impl HalfOpenPermitGuard {
     /// 标记 permit 已通过显式 record_success/failure/neutral 处理。
-    /// Drop 变 no-op（armed=false），避免与显式 release 双重释放。
+    /// 立即释放 permit + 设置 armed=false 让 Drop 变 no-op，避免与显式 release 双重释放。
     /// 注意：disarm 消费 self，所以调用后不能再访问 permit。
+    ///
+    /// 关键：disarm **必须**释放 permit，否则 forwarder 'guard.disarm() + record_success()'
+    /// 的 happy path 会让 half_open_requests 计数泄漏——必须等下一次 transition_to_half_open()
+    /// 才被清零，期间探测被错误挡掉。
     pub fn disarm(mut self) {
-        self.armed = false;
-        // self 在表达式结束时 drop，armed=false → no-op
+        if self.armed {
+            self.armed = false;
+            self.breaker.release_half_open_permit();
+        }
     }
 }
 
@@ -722,25 +728,23 @@ mod tests {
         let result = breaker.allow_request().await;
         let permit = result.permit.expect("必须返回 permit guard");
 
-        // 显式 disarm（标记"已处理"）
+        // 显式 disarm（标记"已处理"）——disarm 立即释放 permit + 让 Drop 变 no-op
         permit.disarm();
 
-        // permit 后续 drop 是 no-op（armed=false）
-        // count 必须 = 1（disarm 不释放，由 record_success 负责）
+        // count 必须 = 0（disarm 已释放，由 disarm 负责，不依赖 record_success）
         let stats = breaker.get_stats().await;
         assert_eq!(
-            stats.half_open_requests, 1,
-            "disarm 后 Drop 应是 no-op，count 应保持 = 1"
+            stats.half_open_requests, 0,
+            "disarm 应立即释放 permit，count 应归 0"
         );
 
-        // 真正 record_success 时释放 permit
-        // ⚠️ 由于 record_success 内部已 release_half_open_permit()，count 直接归 0
-        // 而 guard 后续 drop 因 armed=false 不再 release，避免双重释放
+        // permit 后续 drop 是 no-op（armed=false），不再二次释放
+        // record_success 只更新 breaker 状态机，不动 permit 计数
         breaker.record_success().await;
         let stats = breaker.get_stats().await;
         assert_eq!(
             stats.half_open_requests, 0,
-            "record_success 后 count 应归 0，且不双重释放"
+            "record_success 不应改动 permit 计数（disarm 已释放）"
         );
     }
 
