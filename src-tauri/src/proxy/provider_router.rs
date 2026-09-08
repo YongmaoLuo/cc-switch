@@ -6,7 +6,7 @@ use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::circuit_breaker::{AllowRequestResult, CircuitBreaker, CircuitBreakerConfig};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -138,18 +138,21 @@ impl ProviderRouter {
     ///
     /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
     /// 否则会导致该 Provider 长时间无法进入探测状态。
-    pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
+    pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowRequestResult {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
     }
 
     /// 记录供应商请求结果
+    ///
+    /// **变更**：`used_half_open_permit: bool` 参数已删除（之前总是被忽略，
+    /// CircuitBreaker::record_success/failure 内部无条件 release）。
+    /// 调用方不需要关心 permit 是否在握——permit 生命周期由 RAII guard 管理。
     pub async fn record_result(
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
@@ -164,9 +167,9 @@ impl ProviderRouter {
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
         if success {
-            breaker.record_success(used_half_open_permit).await;
+            breaker.record_success().await;
         } else {
-            breaker.record_failure(used_half_open_permit).await;
+            breaker.record_failure().await;
         }
 
         // 3. 更新数据库健康状态（使用配置的阈值）
@@ -201,15 +204,10 @@ impl ProviderRouter {
     ///
     /// 用于整流器等场景：请求结果不应计入 Provider 健康度，
     /// 但仍需释放占用的探测名额，避免 HalfOpen 状态卡死
-    pub async fn release_permit_neutral(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        used_half_open_permit: bool,
-    ) {
-        if !used_half_open_permit {
-            return;
-        }
+    ///
+    /// **变更**：`used_half_open_permit: bool` 参数已删除（之前仅做 if-true 短路，
+    /// 现在调用 breaker.release_half_open_permit() 总是安全的——count=0 时是 no-op）。
+    pub async fn release_permit_neutral(&self, provider_id: &str, app_type: &str) {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.release_half_open_permit();
@@ -611,7 +609,7 @@ mod tests {
         let router = ProviderRouter::new(db.clone());
 
         router
-            .record_result("b", "claude", false, false, Some("fail".to_string()))
+            .record_result("b", "claude", false, Some("fail".to_string()))
             .await
             .unwrap();
 
@@ -650,14 +648,14 @@ mod tests {
 
         // 触发熔断：1 次失败
         router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .record_result("a", "claude", false, Some("fail".to_string()))
             .await
             .unwrap();
 
         // 第一次请求：获取 HalfOpen 探测名额
         let first = router.allow_provider_request("a", "claude").await;
         assert!(first.allowed);
-        assert!(first.used_half_open_permit);
+        assert!(first.permit.is_some());
 
         // 第二次请求应被拒绝（名额已被占用）
         let second = router.allow_provider_request("a", "claude").await;
@@ -665,13 +663,13 @@ mod tests {
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
         router
-            .release_permit_neutral("a", "claude", first.used_half_open_permit)
+            .release_permit_neutral("a",  "claude")
             .await;
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
-        assert!(third.used_half_open_permit);
+        assert!(third.permit.is_some());
     }
 
     /// 复现 issue：5 小时 quota 用完后，P1 (P_top) 熔断。
@@ -714,13 +712,7 @@ mod tests {
         // === 阶段 1: 模拟 5 小时 quota 用尽，P1 连续 8 次返回 429 ===
         for _ in 0..8 {
             router
-                .record_result(
-                    "p1",
-                    "claude",
-                    false,
-                    false,
-                    Some("HTTP 429: quota exhausted".to_string()),
-                )
+                .record_result("p1", "claude", false, Some("HTTP 429: quota exhausted".to_string()))
                 .await
                 .unwrap();
         }
@@ -762,17 +754,17 @@ mod tests {
             p1_probe.allowed
         );
         assert!(
-            p1_probe.used_half_open_permit,
+            p1_probe.permit.is_some(),
             "P1 应当占用一个 HalfOpen 探测名额"
         );
 
         // === 阶段 4: 模拟 P1 在 quota 重置后连续 3 次成功（success_threshold=2 默认）===
         router
-            .record_result("p1", "claude", true, true, None)
+            .record_result("p1",  "claude",  true,  None)
             .await
             .unwrap();
         router
-            .record_result("p1", "claude", true, true, None)
+            .record_result("p1",  "claude",  true,  None)
             .await
             .unwrap();
 
@@ -831,11 +823,11 @@ mod tests {
         // P1 和 P2 同时被 trip（连续 2 次失败）
         for _ in 0..2 {
             router
-                .record_result("p1", "claude", false, false, Some("quota".to_string()))
+                .record_result("p1", "claude", false, Some("quota".to_string()))
                 .await
                 .unwrap();
             router
-                .record_result("p2", "claude", false, false, Some("quota".to_string()))
+                .record_result("p2", "claude", false, Some("quota".to_string()))
                 .await
                 .unwrap();
         }
@@ -855,9 +847,9 @@ mod tests {
         );
 
         // 模拟 P1 探测失败（quota 还没重置）
-        if p1_probe.used_half_open_permit {
+        if p1_probe.permit.is_some() {
             router
-                .record_result("p1", "claude", true, false, Some("still 429".to_string()))
+                .record_result("p1", "claude", false, Some("still 429".to_string()))
                 .await
                 .unwrap();
         }
@@ -909,7 +901,7 @@ mod tests {
         // Trip P1：8 次连续 429
         for _ in 0..8 {
             router
-                .record_result("p1", "claude", false, false, Some("429 quota".to_string()))
+                .record_result("p1", "claude", false, Some("429 quota".to_string()))
                 .await
                 .unwrap();
         }
@@ -918,30 +910,163 @@ mod tests {
 
         // === 关键场景：探测发出去了，但响应永远丢失（不调 record_result）===
         // 这模拟用户日志里 09:36:33 的 [CB-001] 之后没 [CB-003] 的现象
+        #[allow(deprecated)]
         let first_probe = router.allow_provider_request("p1", "claude").await;
         assert!(first_probe.allowed, "第一次探测必须允许");
         assert!(
-            first_probe.used_half_open_permit,
-            "第一次探测必须占用 permit"
+            first_probe.permit.is_some(),
+            "第一次探测必须返回 permit guard"
         );
 
         // ⚠️ 这里**故意**不调用 record_result —— 模拟"探测响应丢失"，
         // 真实场景里可能是：网络中断、客户端断连、forwarder 内部 panic。
-        // 这时 half_open_requests 计数卡在 1。
+        //
+        // RAII 修复前：half_open_requests 计数卡在 1，第二次探测永远 false
+        // RAII 修复后：guard 随第一次探测 result drop → Drop 自动 release_half_open_permit
+        drop(first_probe);
 
         // 下一次请求来了（90s 后的真实场景；这里用 timeout=0 + sleep 10ms 模拟）
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // 【这是 bug 的核心断言】
-        // 当前实现：返回 allowed=false（因为 half_open_requests 计数卡在 1）
-        // 期望行为：breaker 检测到"上一个探测永远没回来"，应该回收 permit，
-        //          让这一次新的探测能进行。
+        // 修复前：返回 allowed=false（half_open_requests 计数卡在 1）
+        // 修复后（RAII guard Drop 兜底）：allowed=true（permit 已释放）
         let second_probe = router.allow_provider_request("p1", "claude").await;
         assert!(
             second_probe.allowed,
             "上一次探测响应丢失后，下一次请求 P1 仍应当能拿到探测名额。\
-             当前实现下 half_open_requests 计数卡在 1，永远返回 allowed=false，\
-             P1 看起来'卡在 HalfOpen 永远不动'——这正是用户日志里 09:36:33 之后的症状。"
+             RAII guard 的 Drop 必须自动 release permit。"
+        );
+    }
+
+    /// **回归测试 / API 契约**：forwarder.rs 在 HalfOpen 探测期间必须持有 permit guard。
+    ///
+    /// 这是 forwarder.rs:484-491 bug 的核心契约——只有当 `probe.permit` 被绑定到
+    /// 一个跨过 `forward()` 调用的局部变量时，`max_half_open_requests = 1` 的
+    /// 限流才会生效。如果 forwarder.rs 又退化回 `(permit.allowed, permit.used_half_open_permit)`
+    /// 这种"读完字段就让 AllowRequestResult 立刻 drop"的写法，那么本测试虽然本身
+    /// 还能通过（因为它在 API 层用对了模式），但 forwarder.rs 的源文件回归测试
+    /// （`forwarder_does_not_release_permit_early`）会立刻失败。
+    ///
+    /// 本测试 PASSES today，作用是文档化契约：guard 必须显式绑定。
+    #[tokio::test]
+    #[serial]
+    async fn test_holding_guard_enforces_max_one_in_flight() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let p1 = Provider::with_id("p1".to_string(), "P1".to_string(), json!({}), None);
+        db.save_provider("claude", &p1).unwrap();
+        db.add_to_failover_queue("claude", "p1").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        // Trip P1 → HalfOpen（timeout=0）
+        router
+            .record_result("p1", "claude", false, Some("429".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // === 正确模式：把 permit 绑定到一个跨过"请求生命周期"的变量 ===
+        #[allow(deprecated)]
+        let probe = router.allow_provider_request("p1", "claude").await;
+        assert!(probe.allowed, "第一次探测必须允许");
+        assert!(
+            probe.permit.is_some(),
+            "第一次探测必须返回 permit guard"
+        );
+        let guard = probe.permit; // ← 关键：绑定 guard，不让它随 probe drop
+        let _used_half_open_permit = guard.is_some(); // 派生 bool（迁移后替代旧字段）
+
+        // 关键断言：guard 持有期间，第二次并发探测必须被 REJECT
+        let concurrent_probe = router.allow_provider_request("p1", "claude").await;
+        assert!(
+            !concurrent_probe.allowed,
+            "max_half_open_requests = 1 必须在 guard 持有期间生效。\
+             当前实现若退化回 destructure 写法，guard 会在探测前 drop，\
+             permit 立即释放 → 这里会允许第二次探测 → 测试失败。"
+        );
+
+        // 释放 guard（模拟 forwarder.rs 在请求完成后调用 record_*_result 走 disarm / drop）
+        drop(guard);
+
+        // guard 释放后，下一次探测应当被允许
+        let after_release = router.allow_provider_request("p1", "claude").await;
+        assert!(
+            after_release.allowed,
+            "guard 释放后下一次探测必须被允许"
+        );
+    }
+
+    /// **回归测试 / 行为证明**：旧的 destructure 写法会导致并发探测通过（这就是 bug）。
+    ///
+    /// 本测试 PASSES today——它文档化了"destructure + drop"这种用法的实际行为：
+    /// permit 会被立刻释放，第二次探测会通过。
+    /// 它的存在是为了让任何人想"简化" forwarder.rs 时三思——
+    /// 写成 `(probe.allowed, probe.permit.is_some())` 后再让 probe drop
+    /// 是 P0 级别 bug 的根源。
+    #[tokio::test]
+    #[serial]
+    async fn test_destructure_pattern_releases_permit_immediately() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let p1 = Provider::with_id("p1".to_string(), "P1".to_string(), json!({}), None);
+        db.save_provider("claude", &p1).unwrap();
+        db.add_to_failover_queue("claude", "p1").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        router
+            .record_result("p1", "claude", false, Some("429".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // === 模拟 forwarder.rs 的旧 buggy 写法 ===
+        // 在表达式结束后，probe 整个被 drop，里面的 permit guard 也 drop，
+        // release_half_open_permit 立刻执行。
+        #[allow(deprecated)]
+        let (allowed, _used_half_open_permit) = {
+            let probe = router.allow_provider_request("p1", "claude").await;
+            (probe.allowed, probe.permit.is_some())
+            // ← probe 在这里出作用域 → permit guard drop → permit 立即释放
+        };
+        assert!(allowed, "第一次探测必须允许");
+
+        // 行为断言：destructure 后 permit 已经释放，第二次探测被允许
+        // （这正是 forwarder.rs 的 bug：探测还没发出去，permit 就还回去了）
+        #[allow(deprecated)]
+        let second_probe = router.allow_provider_request("p1", "claude").await;
+        assert!(
+            second_probe.allowed,
+            "destructure 写法会立刻释放 permit，所以第二次探测会通过——\
+             这正是 forwarder.rs 的 P0 bug。forwarder.rs 必须改用 `let guard = probe.permit;`。"
         );
     }
 }
