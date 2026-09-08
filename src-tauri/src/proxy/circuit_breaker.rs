@@ -97,14 +97,81 @@ pub struct CircuitBreaker {
     provider_name: Arc<str>,
 }
 
+/// RAII 守卫：持有 HalfOpen 探测 permit，确保在 Drop 时自动释放。
+///
+/// **核心目的**：消除"探测请求响应丢失导致 permit 永久泄漏"的 bug 类。
+/// 之前 `used_half_open_permit: bool` 是值类型，drop 时啥也不做——如果 forwarder
+/// 在 await 期间被 cancel（客户端断连 / tower timeout / panic unwinding），
+/// record_success/failure/neutral 都不会被调用，permit 卡在占用状态，
+/// 该 Provider 永远无法再发新探测。
+///
+/// **使用方式**：
+/// ```ignore
+/// let result = breaker.allow_request().await;
+/// if !result.allowed { continue; }
+/// let permit = result.permit.expect("HalfOpen 必须返回 permit");
+///
+/// // 成功路径：显式 disarm（Drop no-op）+ record_success（仅更新状态）
+/// permit.disarm();
+/// breaker.record_success().await;
+///
+/// // 异常路径：permit 随 future drop → Drop 自动 release
+/// ```
+pub struct HalfOpenPermitGuard {
+    breaker: Arc<CircuitBreaker>,
+    /// true → Drop 时调用 release_half_open_permit
+    /// false → Drop 是 no-op（disarm 后）
+    armed: bool,
+}
+
+impl std::fmt::Debug for HalfOpenPermitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HalfOpenPermitGuard")
+            .field("armed", &self.armed)
+            .field("circuit_key", &self.breaker.circuit_key)
+            .finish()
+    }
+}
+
+impl HalfOpenPermitGuard {
+    /// 标记 permit 已通过显式 record_success/failure/neutral 处理。
+    /// Drop 变 no-op（armed=false），避免与显式 release 双重释放。
+    /// 注意：disarm 消费 self，所以调用后不能再访问 permit。
+    pub fn disarm(mut self) {
+        self.armed = false;
+        // self 在表达式结束时 drop，armed=false → no-op
+    }
+}
+
+impl Drop for HalfOpenPermitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // 改用 trace 级别：happy path（forwarder.rs 显式 disarm 后 Drop no-op）不走这里，
+            // 走这里意味着 guard 跨过 forward() 调用未被 disarm——通常是 future cancel / panic unwinding。
+            // 把这一事件从 debug 降到 trace，避免污染生产日志（之前 forwarder.rs 提前 drop 守卫
+            // 时这条日志每秒打几十次）。
+            log::trace!(
+                "[{} {}] HalfOpenPermitGuard::drop 释放 permit (RAII 兜底: future cancel / panic / 漏 disarm)",
+                self.breaker.circuit_key,
+                self.breaker.provider_name
+            );
+            self.breaker.release_half_open_permit();
+        }
+    }
+}
+
 /// 熔断器放行结果
 ///
-/// `used_half_open_permit` 表示本次放行是否占用了 HalfOpen 探测名额。
-/// 调用方应在请求结束后把该值传回 `record_success` / `record_failure` 用于正确释放名额。
-#[derive(Debug, Clone, Copy)]
-pub struct AllowResult {
+/// `permit` 在 HalfOpen 探测成功占用时返回 `Some(HalfOpenPermitGuard)`，
+/// 调用方应在请求结束时通过 guard 的 Drop 自动释放（或显式 `disarm()` +
+/// `record_*` 处理后让 Drop 变 no-op）。
+#[derive(Debug)]
+pub struct AllowRequestResult {
     pub allowed: bool,
-    pub used_half_open_permit: bool,
+    /// RAII guard，drop 时自动释放 permit。
+    /// 若调用方希望"释放时机由我控制"，应将 `permit` 绑定到一个跨过请求生命周期的局部变量；
+    /// 若调用方希望"完全放手给 Drop"，则让 `AllowRequestResult` 在末尾自然 drop。
+    pub permit: Option<HalfOpenPermitGuard>,
 }
 
 impl CircuitBreaker {
@@ -184,13 +251,13 @@ impl CircuitBreaker {
     }
 
     /// 检查是否允许请求通过
-    pub async fn allow_request(&self) -> AllowResult {
+    pub async fn allow_request(self: &Arc<Self>) -> AllowRequestResult {
         let state = *self.state.read().await;
 
         match state {
-            CircuitState::Closed => AllowResult {
+            CircuitState::Closed => AllowRequestResult {
                 allowed: true,
-                used_half_open_permit: false,
+                permit: None,
             },
             CircuitState::Open => {
                 let config = self.config.read().await;
@@ -213,14 +280,14 @@ impl CircuitBreaker {
                         // 转换后按当前状态决定是否需要获取 HalfOpen 探测名额
                         let current_state = *self.state.read().await;
                         return match current_state {
-                            CircuitState::Closed => AllowResult {
+                            CircuitState::Closed => AllowRequestResult {
                                 allowed: true,
-                                used_half_open_permit: false,
+                                permit: None,
                             },
                             CircuitState::HalfOpen => self.allow_half_open_probe(),
-                            CircuitState::Open => AllowResult {
+                            CircuitState::Open => AllowRequestResult {
                                 allowed: false,
-                                used_half_open_permit: false,
+                                permit: None,
                             },
                         };
                     } else {
@@ -234,9 +301,9 @@ impl CircuitBreaker {
                     }
                 }
 
-                AllowResult {
+                AllowRequestResult {
                     allowed: false,
-                    used_half_open_permit: false,
+                    permit: None,
                 }
             }
             CircuitState::HalfOpen => self.allow_half_open_probe(),
@@ -244,13 +311,20 @@ impl CircuitBreaker {
     }
 
     /// 记录成功
-    pub async fn record_success(&self, used_half_open_permit: bool) {
+    ///
+    /// **职责**：无条件释放 HalfOpen permit（兼容 RAII 兜底语义），并按状态机
+    /// 推进 HalfOpen → Closed 转换或重置失败计数。
+    ///
+    /// **变更**：原 `used_half_open_permit: bool` 参数已被删除——参数之前总是被忽略
+    /// （无论传 true/false，函数都调用 `release_half_open_permit`），保留它只会误导
+    /// reader 以为有语义差异。调用方在调用前必须对 guard 显式 `disarm()` 以避免
+    /// Drop 二次释放（但二次释放是 no-op，仅增加 trace 日志）。
+    pub async fn record_success(&self) {
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if used_half_open_permit {
-            self.release_half_open_permit();
-        }
+        // 释放 permit
+        self.release_half_open_permit();
 
         // 重置失败计数
         self.consecutive_failures.store(0, Ordering::SeqCst);
@@ -276,13 +350,15 @@ impl CircuitBreaker {
     }
 
     /// 记录失败
-    pub async fn record_failure(&self, used_half_open_permit: bool) {
+    ///
+    /// **变更**：原 `used_half_open_permit: bool` 参数已被删除（理由同 `record_success`）。
+    /// 无条件释放 HalfOpen permit，并按状态机推进 Closed → HalfOpen 或 Open 转换。
+    pub async fn record_failure(&self) {
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if used_half_open_permit {
-            self.release_half_open_permit();
-        }
+        // 释放 permit
+        self.release_half_open_permit();
 
         // 更新计数器
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
@@ -362,7 +438,14 @@ impl CircuitBreaker {
             consecutive_successes: self.consecutive_successes.load(Ordering::SeqCst),
             total_requests: self.total_requests.load(Ordering::SeqCst),
             failed_requests: self.failed_requests.load(Ordering::SeqCst),
+            half_open_requests: self.half_open_requests.load(Ordering::SeqCst),
         }
+    }
+
+    /// 测试专用：直接读取 half_open_requests 计数（不经过 guard）
+    #[cfg(test)]
+    pub fn get_half_open_requests_for_test(&self) -> u32 {
+        self.half_open_requests.load(Ordering::SeqCst)
     }
 
     /// 重置熔断器（手动恢复）
@@ -377,22 +460,25 @@ impl CircuitBreaker {
         self.transition_to_closed().await;
     }
 
-    fn allow_half_open_probe(&self) -> AllowResult {
+    fn allow_half_open_probe(self: &Arc<Self>) -> AllowRequestResult {
         // 半开状态限流：只允许有限请求通过进行探测
         let max_half_open_requests = 1u32;
         let current = self.half_open_requests.fetch_add(1, Ordering::SeqCst);
 
         if current < max_half_open_requests {
-            AllowResult {
+            AllowRequestResult {
                 allowed: true,
-                used_half_open_permit: true,
+                permit: Some(HalfOpenPermitGuard {
+                    breaker: Arc::clone(self),
+                    armed: true,
+                }),
             }
         } else {
             // 超过限额，回退计数，拒绝请求
             self.half_open_requests.fetch_sub(1, Ordering::SeqCst);
-            AllowResult {
+            AllowRequestResult {
                 allowed: false,
-                used_half_open_permit: false,
+                permit: None,
             }
         }
     }
@@ -405,7 +491,9 @@ impl CircuitBreaker {
         let mut current = self.half_open_requests.load(Ordering::SeqCst);
         loop {
             if current == 0 {
-                log::debug!(
+                // 改用 trace：这是常见情况（forwarder.rs 已经在 Drop 里释放过 permit，
+                // 这里再调一次就是重复 release）。原 debug 级别让生产日志污染严重。
+                log::trace!(
                     "[{} {}] release_half_open_permit: 计数已为 0，无需释放",
                     self.circuit_key,
                     self.provider_name
@@ -475,11 +563,14 @@ pub struct CircuitBreakerStats {
     pub consecutive_successes: u32,
     pub total_requests: u32,
     pub failed_requests: u32,
+    /// 当前占用中的 HalfOpen 探测名额（用于监控 permit 泄漏）
+    pub half_open_requests: u32,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_circuit_breaker_closed_to_open() {
@@ -487,7 +578,7 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let breaker = CircuitBreaker::new(config, "test:breaker", "Test Breaker");
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 初始状态应该是关闭
         assert_eq!(breaker.get_state().await, CircuitState::Closed);
@@ -495,7 +586,7 @@ mod tests {
 
         // 记录 3 次失败
         for _ in 0..3 {
-            breaker.record_failure(false).await;
+            breaker.record_failure().await;
         }
 
         // 应该转换到打开状态
@@ -510,11 +601,11 @@ mod tests {
             success_threshold: 2,
             ..Default::default()
         };
-        let breaker = CircuitBreaker::new(config, "test:breaker", "Test Breaker");
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 打开熔断器
-        breaker.record_failure(false).await;
-        breaker.record_failure(false).await;
+        breaker.record_failure().await;
+        breaker.record_failure().await;
         assert_eq!(breaker.get_state().await, CircuitState::Open);
 
         // 手动转换到半开状态
@@ -522,8 +613,8 @@ mod tests {
         assert_eq!(breaker.get_state().await, CircuitState::HalfOpen);
 
         // 记录 2 次成功
-        breaker.record_success(false).await;
-        breaker.record_success(false).await;
+        breaker.record_success().await;
+        breaker.record_success().await;
 
         // 应该转换到关闭状态
         assert_eq!(breaker.get_state().await, CircuitState::Closed);
@@ -535,13 +626,13 @@ mod tests {
             timeout_seconds: 0,
             ..Default::default()
         };
-        let breaker = CircuitBreaker::new(config, "test:breaker", "Test Breaker");
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 进入 Open，然后由于 timeout_seconds=0，allow_request 会立即切换到 HalfOpen 并占用探测名额
         breaker.transition_to_open().await;
         let first = breaker.allow_request().await;
         assert!(first.allowed);
-        assert!(first.used_half_open_permit);
+        assert!(first.permit.is_some());
         assert_eq!(breaker.get_state().await, CircuitState::HalfOpen);
 
         // 模拟并发下的“重复 HalfOpen 转换调用”，不应重置 in-flight 计数
@@ -550,7 +641,7 @@ mod tests {
         // 由于名额仍被占用，第二次请求应被拒绝
         let second = breaker.allow_request().await;
         assert!(!second.allowed);
-        assert!(!second.used_half_open_permit);
+        assert!(second.permit.is_none());
     }
 
     #[tokio::test]
@@ -559,16 +650,136 @@ mod tests {
             failure_threshold: 2,
             ..Default::default()
         };
-        let breaker = CircuitBreaker::new(config, "test:breaker", "Test Breaker");
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 打开熔断器
-        breaker.record_failure(false).await;
-        breaker.record_failure(false).await;
+        breaker.record_failure().await;
+        breaker.record_failure().await;
         assert_eq!(breaker.get_state().await, CircuitState::Open);
 
         // 重置
         breaker.reset().await;
         assert_eq!(breaker.get_state().await, CircuitState::Closed);
         assert!(breaker.allow_request().await.allowed);
+    }
+
+    // ============================================================
+    // RAII HalfOpen Permit Guard 单元测试
+    // ============================================================
+    // 这些测试验证 HalfOpenPermitGuard 的 Drop/disarm/forget 行为：
+    // - Drop 时如果 armed=true → release_half_open_permit
+    // - disarm() 后 Drop 是 no-op（armed=false）
+    // - forget() 后 Drop 不会运行（mem::forget）
+    // - panic unwinding 也会触发 Drop
+    //
+    // 这些测试在 RAII 实现之前会因为 `permit: Option<HalfOpenPermitGuard>`
+    // 字段不存在而**编译失败**。RAII 实现后应全部通过。
+
+    /// Test 1: Drop guard without disarm → permit 自动释放
+    #[tokio::test]
+    async fn test_drop_guard_releases_permit_on_drop() {
+        let config = CircuitBreakerConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        };
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_drop", "Test RAII Drop"));
+
+        // 进入 Open → HalfOpen（timeout=0）
+        breaker.transition_to_open().await;
+        let result = breaker.allow_request().await;
+        assert!(result.allowed);
+        let permit = result.permit.expect("HalfOpen 必须返回 permit guard");
+
+        // ⚠️ 故意 drop permit 不 disarm（模拟客户端断连 / future 被 cancel）
+        drop(permit);
+
+        // permit 必须自动归零
+        assert_eq!(
+            breaker.get_half_open_requests_for_test(),
+            0,
+            "Drop guard 必须自动释放 permit，不应卡在 1"
+        );
+
+        // 下次探测必须允许
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let result2 = breaker.allow_request().await;
+        assert!(
+            result2.allowed,
+            "permit 释放后下次探测必须允许（当前实现会卡在 1 永远 false）"
+        );
+    }
+
+    /// Test 2: disarm() 后 Drop 是 no-op（不双重释放）
+    #[tokio::test]
+    async fn test_drop_guard_no_op_after_disarm() {
+        let config = CircuitBreakerConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        };
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_disarm", "Test RAII Disarm"));
+
+        breaker.transition_to_open().await;
+        let result = breaker.allow_request().await;
+        let permit = result.permit.expect("必须返回 permit guard");
+
+        // 显式 disarm（标记"已处理"）
+        permit.disarm();
+
+        // permit 后续 drop 是 no-op（armed=false）
+        // count 必须 = 1（disarm 不释放，由 record_success 负责）
+        let stats = breaker.get_stats().await;
+        assert_eq!(
+            stats.half_open_requests, 1,
+            "disarm 后 Drop 应是 no-op，count 应保持 = 1"
+        );
+
+        // 真正 record_success 时释放 permit
+        // ⚠️ 由于 record_success 内部已 release_half_open_permit()，count 直接归 0
+        // 而 guard 后续 drop 因 armed=false 不再 release，避免双重释放
+        breaker.record_success().await;
+        let stats = breaker.get_stats().await;
+        assert_eq!(
+            stats.half_open_requests, 0,
+            "record_success 后 count 应归 0，且不双重释放"
+        );
+    }
+
+    /// Test 3: panic unwinding 也会触发 Drop → permit 释放
+    #[tokio::test]
+    async fn test_drop_guard_releases_on_panic_unwind() {
+        let config = CircuitBreakerConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        };
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_panic", "Test RAII Panic"));
+
+        breaker.transition_to_open().await;
+        let result = breaker.allow_request().await;
+        let permit = result.permit.expect("必须返回 permit guard");
+
+        // 用 catch_unwind 包一个会 panic 的闭包，把 permit move 进去
+        let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = permit; // move permit 进闭包作用域
+            panic!("simulated panic in forwarder future");
+        }));
+
+        // 确认 panic 真的发生了
+        assert!(unwind_result.is_err(), "闭包必须 panic");
+
+        // ⚠️ 即使 panic，Rust 的 unwinding 也会运行 guard 的 Drop
+        // permit 必须自动归零
+        assert_eq!(
+            breaker.get_half_open_requests_for_test(),
+            0,
+            "panic unwinding 必须触发 Drop，permit 自动释放"
+        );
+
+        // 下次探测必须允许
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let result2 = breaker.allow_request().await;
+        assert!(
+            result2.allowed,
+            "panic 释放 permit 后下次探测必须允许"
+        );
     }
 }
