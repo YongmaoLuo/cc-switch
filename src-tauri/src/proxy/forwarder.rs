@@ -742,8 +742,7 @@ impl RequestForwarder {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
                                 // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
                                 self.router
-                                    .release_permit_neutral(&provider.id,
-                                        app_type_str)
+                                    .release_permit_neutral(&provider.id, app_type_str)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -894,8 +893,7 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(&provider.id,
-                                        app_type_str)
+                                    .release_permit_neutral(&provider.id, app_type_str)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -917,8 +915,7 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(&provider.id,
-                                        app_type_str)
+                                    .release_permit_neutral(&provider.id, app_type_str)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -1039,8 +1036,7 @@ impl RequestForwarder {
 
                     if signature_rectifier_non_retryable_client_error {
                         self.router
-                            .release_permit_neutral(&provider.id,
-                                app_type_str)
+                            .release_permit_neutral(&provider.id, app_type_str)
                             .await;
                         let mut status = self.status.write().await;
                         status.failed_requests += 1;
@@ -1186,8 +1182,7 @@ impl RequestForwarder {
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
                             self.router
-                                .release_permit_neutral(&provider.id,
-                                    app_type_str)
+                                .release_permit_neutral(&provider.id, app_type_str)
                                 .await;
                             {
                                 let mut status = self.status.write().await;
@@ -3014,13 +3009,7 @@ async fn check_fallback_provider_quota(provider: &Provider, app_type: &AppType) 
     }
 
     let quota = match crate::services::coding_plan::get_coding_plan_quota(
-        &base_url,
-        &api_key,
-        None,
-        None,
-        None,
-        None,
-        None,
+        &base_url, &api_key, None, None, None, None, None,
     )
     .await
     {
@@ -5689,7 +5678,14 @@ mod tests {
     #[test]
     fn forwarder_does_not_release_permit_early() {
         // 拆分 buggy pattern 避免 include_str 自匹配
-        let buggy_pattern: String = ["(", "permit", ".allowed, ", "permit", ".used_half_open_permit)"].concat();
+        let buggy_pattern: String = [
+            "(",
+            "permit",
+            ".allowed, ",
+            "permit",
+            ".used_half_open_permit)",
+        ]
+        .concat();
 
         let forwarder_src = include_str!("forwarder.rs");
 
@@ -5742,22 +5738,24 @@ mod tests {
     impl MockUpstream {
         /// 标准成功响应（Anthropic 格式），可配置延迟
         async fn success_with_delay(delay: Duration) -> Self {
-            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> =
-                Arc::new(move || MockResponse {
+            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> = Arc::new(move || {
+                MockResponse {
                     status: 200,
                     body: r#"{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#.to_string(),
                     delay,
-                });
+                }
+            });
             Self::spawn(responder).await
         }
 
         /// 永远不响应（让 client 一直 hang），用于 client disconnect 测试
         async fn hang() -> Self {
-            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> = Arc::new(|| MockResponse {
-                status: 0, // 0 = never write
-                body: String::new(),
-                delay: Duration::from_secs(60),
-            });
+            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> =
+                Arc::new(|| MockResponse {
+                    status: 0, // 0 = never write
+                    body: String::new(),
+                    delay: Duration::from_secs(60),
+                });
             Self::spawn(responder).await
         }
 
@@ -5860,11 +5858,15 @@ mod tests {
             router,
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
-            gemini_shadow: Arc::new(crate::proxy::providers::gemini_shadow::GeminiShadowStore::new()),
+            gemini_shadow: Arc::new(
+                crate::proxy::providers::gemini_shadow::GeminiShadowStore::new(),
+            ),
             codex_chat_history: Arc::new(
                 crate::proxy::providers::codex_chat_history::CodexChatHistoryStore::default(),
             ),
-            failover_manager: Arc::new(crate::proxy::failover_switch::FailoverSwitchManager::new(db)),
+            failover_manager: Arc::new(crate::proxy::failover_switch::FailoverSwitchManager::new(
+                db,
+            )),
             app_handle: None,
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
@@ -5945,7 +5947,9 @@ mod tests {
         db.update_proxy_config_for_app(config).await.unwrap();
 
         // 先用 1 次失败把 p1 trip 到 Open→HalfOpen
-        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(db.clone()));
+        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
+            db.clone(),
+        ));
         router
             .record_result("p1", "claude", false, Some("test fail".to_string()))
             .await
@@ -6001,7 +6005,10 @@ mod tests {
         // === Assert (3): 等 forwarder 完成（500ms 之后）===
         let _ = handle.await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let stats_after = router.get_circuit_breaker_stats("p1", "claude").await.unwrap();
+        let stats_after = router
+            .get_circuit_breaker_stats("p1", "claude")
+            .await
+            .unwrap();
         assert_eq!(
             stats_after.half_open_requests, 0,
             "forwarder 完成后 permit 必须释放（half_open_requests 应为 0）"
@@ -6068,7 +6075,9 @@ mod tests {
         config.circuit_timeout_seconds = 0;
         db.update_proxy_config_for_app(config).await.unwrap();
 
-        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(db.clone()));
+        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
+            db.clone(),
+        ));
         router
             .record_result("p1", "claude", false, Some("test fail".to_string()))
             .await
@@ -6094,7 +6103,10 @@ mod tests {
 
         // 等 forwarder 进入 forward()（mock hang）
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let stats_before_abort = router.get_circuit_breaker_stats("p1", "claude").await.unwrap();
+        let stats_before_abort = router
+            .get_circuit_breaker_stats("p1", "claude")
+            .await
+            .unwrap();
         assert_eq!(
             stats_before_abort.half_open_requests, 1,
             "forwarder 进入 forward() 时 permit 必须被持有"
@@ -6107,7 +6119,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // === Assert: abort 后 permit 必须被释放（不能泄漏）===
-        let stats_after_abort = router.get_circuit_breaker_stats("p1", "claude").await.unwrap();
+        let stats_after_abort = router
+            .get_circuit_breaker_stats("p1", "claude")
+            .await
+            .unwrap();
         assert_eq!(
             stats_after_abort.half_open_requests, 0,
             "RED ASSERT: client disconnect 后 RAII guard 必须释放 HalfOpen permit。\
@@ -6129,11 +6144,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn forwarder_permit_guard_released_on_panic() {
-        use crate::proxy::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, HalfOpenPermitGuard};
+        use crate::proxy::circuit_breaker::{
+            CircuitBreaker, CircuitBreakerConfig, HalfOpenPermitGuard,
+        };
 
         let _home = tempfile::TempDir::new().expect("temp dir");
         let db = Arc::new(Database::memory().unwrap());
-        let _router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(db.clone()));
+        let _router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
+            db.clone(),
+        ));
 
         // 直接构造 CircuitBreaker（无需 router），模拟 HalfOpen 状态
         let breaker = Arc::new(CircuitBreaker::new(
@@ -6153,7 +6172,11 @@ mod tests {
         // 模拟 forwarder.rs 的持有模式：guard 绑到外部变量
         let probe = breaker.allow_request().await;
         let permit_guard: HalfOpenPermitGuard = probe.permit.expect("must have guard");
-        assert_eq!(breaker.get_half_open_requests_for_test(), 1, "permit acquired");
+        assert_eq!(
+            breaker.get_half_open_requests_for_test(),
+            1,
+            "permit acquired"
+        );
 
         // === Act: 把 guard move 进 panic 闭包，验证 guard Drop 在栈展开时触发 ===
         let breaker_clone = breaker.clone();

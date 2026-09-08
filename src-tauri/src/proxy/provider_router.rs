@@ -138,7 +138,11 @@ impl ProviderRouter {
     ///
     /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
     /// 否则会导致该 Provider 长时间无法进入探测状态。
-    pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowRequestResult {
+    pub async fn allow_provider_request(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> AllowRequestResult {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
@@ -662,9 +666,7 @@ mod tests {
         assert!(!second.allowed);
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
-        router
-            .release_permit_neutral("a",  "claude")
-            .await;
+        router.release_permit_neutral("a", "claude").await;
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;
@@ -712,7 +714,12 @@ mod tests {
         // === 阶段 1: 模拟 5 小时 quota 用尽，P1 连续 8 次返回 429 ===
         for _ in 0..8 {
             router
-                .record_result("p1", "claude", false, Some("HTTP 429: quota exhausted".to_string()))
+                .record_result(
+                    "p1",
+                    "claude",
+                    false,
+                    Some("HTTP 429: quota exhausted".to_string()),
+                )
                 .await
                 .unwrap();
         }
@@ -760,11 +767,11 @@ mod tests {
 
         // === 阶段 4: 模拟 P1 在 quota 重置后连续 3 次成功（success_threshold=2 默认）===
         router
-            .record_result("p1",  "claude",  true,  None)
+            .record_result("p1", "claude", true, None)
             .await
             .unwrap();
         router
-            .record_result("p1",  "claude",  true,  None)
+            .record_result("p1", "claude", true, None)
             .await
             .unwrap();
 
@@ -984,10 +991,7 @@ mod tests {
         #[allow(deprecated)]
         let probe = router.allow_provider_request("p1", "claude").await;
         assert!(probe.allowed, "第一次探测必须允许");
-        assert!(
-            probe.permit.is_some(),
-            "第一次探测必须返回 permit guard"
-        );
+        assert!(probe.permit.is_some(), "第一次探测必须返回 permit guard");
         let guard = probe.permit; // ← 关键：绑定 guard，不让它随 probe drop
         let _used_half_open_permit = guard.is_some(); // 派生 bool（迁移后替代旧字段）
 
@@ -1005,10 +1009,7 @@ mod tests {
 
         // guard 释放后，下一次探测应当被允许
         let after_release = router.allow_provider_request("p1", "claude").await;
-        assert!(
-            after_release.allowed,
-            "guard 释放后下一次探测必须被允许"
-        );
+        assert!(after_release.allowed, "guard 释放后下一次探测必须被允许");
     }
 
     /// **回归测试 / 行为证明**：旧的 destructure 写法会导致并发探测通过（这就是 bug）。

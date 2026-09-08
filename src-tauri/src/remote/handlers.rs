@@ -3,8 +3,8 @@
 use super::html::REMOTE_HTML;
 use super::RemoteState;
 use crate::app_config::AppType;
-use crate::commands::{self, CopilotAuthState};
 use crate::commands::xai_oauth::XaiOAuthState;
+use crate::commands::{self, CopilotAuthState};
 use crate::services::{ProviderService, ProviderSortUpdate};
 use crate::store::AppState;
 use axum::extract::State as AxumState;

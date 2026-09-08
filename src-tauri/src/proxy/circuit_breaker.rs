@@ -584,7 +584,8 @@ mod tests {
             failure_threshold: 3,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
+        let breaker =
+            std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 初始状态应该是关闭
         assert_eq!(breaker.get_state().await, CircuitState::Closed);
@@ -607,7 +608,8 @@ mod tests {
             success_threshold: 2,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
+        let breaker =
+            std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 打开熔断器
         breaker.record_failure().await;
@@ -632,7 +634,8 @@ mod tests {
             timeout_seconds: 0,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
+        let breaker =
+            std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 进入 Open，然后由于 timeout_seconds=0，allow_request 会立即切换到 HalfOpen 并占用探测名额
         breaker.transition_to_open().await;
@@ -656,7 +659,8 @@ mod tests {
             failure_threshold: 2,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
+        let breaker =
+            std::sync::Arc::new(CircuitBreaker::new(config, "test:breaker", "Test Breaker"));
 
         // 打开熔断器
         breaker.record_failure().await;
@@ -688,7 +692,11 @@ mod tests {
             timeout_seconds: 0,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_drop", "Test RAII Drop"));
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(
+            config,
+            "test:raii_drop",
+            "Test RAII Drop",
+        ));
 
         // 进入 Open → HalfOpen（timeout=0）
         breaker.transition_to_open().await;
@@ -722,7 +730,11 @@ mod tests {
             timeout_seconds: 0,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_disarm", "Test RAII Disarm"));
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(
+            config,
+            "test:raii_disarm",
+            "Test RAII Disarm",
+        ));
 
         breaker.transition_to_open().await;
         let result = breaker.allow_request().await;
@@ -755,7 +767,11 @@ mod tests {
             timeout_seconds: 0,
             ..Default::default()
         };
-        let breaker = std::sync::Arc::new(CircuitBreaker::new(config, "test:raii_panic", "Test RAII Panic"));
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(
+            config,
+            "test:raii_panic",
+            "Test RAII Panic",
+        ));
 
         breaker.transition_to_open().await;
         let result = breaker.allow_request().await;
@@ -781,9 +797,6 @@ mod tests {
         // 下次探测必须允许
         tokio::time::sleep(Duration::from_millis(10)).await;
         let result2 = breaker.allow_request().await;
-        assert!(
-            result2.allowed,
-            "panic 释放 permit 后下次探测必须允许"
-        );
+        assert!(result2.allowed, "panic 释放 permit 后下次探测必须允许");
     }
 }

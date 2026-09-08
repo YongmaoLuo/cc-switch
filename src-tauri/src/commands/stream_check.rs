@@ -30,7 +30,8 @@ pub async fn stream_check_provider(
 
     // Copilot 端点是动态的（随 OAuth token 解析），需预先取出 host 再探测；
     // 其余供应商传 None，由服务层从 settings_config 提取 base_url。无需鉴权。
-    let base_url_override = resolve_copilot_base_url_override(provider, copilot_state.inner()).await?;
+    let base_url_override =
+        resolve_copilot_base_url_override(provider, copilot_state.inner()).await?;
     let result =
         StreamCheckService::check_with_retry(&app_type, provider, &config, base_url_override)
             .await?;
