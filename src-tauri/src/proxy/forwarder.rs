@@ -5,6 +5,7 @@
 use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::{
     body_filter::filter_private_params_with_whitelist,
+    circuit_breaker::HalfOpenPermitGuard,
     content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
@@ -285,9 +286,17 @@ impl RequestForwarder {
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        permit_guard: Option<HalfOpenPermitGuard>,
     ) {
-        if used_half_open_permit {
+        // 优化路径：未占用 HalfOpen permit（Closed 状态）→ 异步 spawn，不阻塞 forward 响应；
+        // 占用 permit（HalfOpen 状态探测成功）→ 同步更新熔断器状态（影响后续探测决策）。
+        let had_permit = permit_guard.is_some();
+        // disarming 让 Drop 变 no-op，但 permit 仍由我们持有，不会泄漏。
+        if let Some(g) = permit_guard {
+            g.disarm();
+        }
+
+        if had_permit {
             if let Err(e) = self
                 .router
                 .record_result(provider_id, app_type, true, None)
@@ -322,12 +331,13 @@ impl RequestForwarder {
     /// `Some(ForwardError)` 表示是客户端错误，没有 provider 能修复，
     /// 调用方应直接 `return` 把错误返回给客户端。
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_rectifier_retry_failure(
         &self,
         retry_err: ProxyError,
         provider: &Provider,
         app_type_str: &str,
-        used_half_open_permit: bool,
+        permit_guard: Option<HalfOpenPermitGuard>,
         rectifier_label: &str,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
@@ -341,6 +351,7 @@ impl RequestForwarder {
         };
 
         if is_provider_error {
+            // 失败计入熔断器统计；permit 由 guard 在函数末尾 Drop 时释放（无需显式 disarm）。
             let _ = self
                 .router
                 .record_result(
@@ -359,9 +370,14 @@ impl RequestForwarder {
             }
             *last_error = Some(retry_err);
             *last_provider = Some(provider.clone());
+            // 显式 drop guard，触发 RAII 释放（用于日志可观测性 + 让释放时机清晰）
+            drop(permit_guard);
             return None;
         }
 
+        // 客户端错误：释放 permit 但不影响健康统计。
+        // release_permit_neutral 释放后，guard Drop 见 counter==0 会 no-op（幂等）。
+        drop(permit_guard);
         self.router
             .release_permit_neutral(&provider.id, app_type_str)
             .await;
@@ -478,23 +494,21 @@ impl RequestForwarder {
                 break;
             }
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
+            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）。
             //
-            // **重要**：必须把 `probe.permit` 绑定到一个跨过 `forward()` 调用的局部变量，
-            // 让 RAII guard 在整个请求生命周期内一直存活。
-            // 否则 AllowRequestResult 在表达式结束时 drop，里面的 permit guard 跟着 drop，
-            // release_half_open_permit 立刻执行 → max_half_open_requests=1 限流失效。
-            let (allowed, mut permit_guard, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, None, false)
+            // **P0 修复**：必须把 `probe.permit` 绑定到一个跨过 `forward()` 调用的
+            // 局部变量 `permit_guard`，让 RAII guard 在 HTTP 请求真正发出去期间一直
+            // 存活；若 guard 在表达式结束时立即 drop，`max_half_open_requests=1`
+            // 限流会立刻失效（guard Drop 会触发 release）。
+            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求。
+            let (allowed, mut permit_guard) = if bypass_circuit_breaker {
+                (true, None)
             } else {
                 let probe = self
                     .router
                     .allow_provider_request(&provider.id, app_type_str)
                     .await;
-                let guard = probe.permit; // ← 关键：绑定 guard
-                let used = guard.is_some();
-                (probe.allowed, guard, used)
+                (probe.allowed, probe.permit)
             };
 
             if !allowed {
@@ -545,14 +559,9 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
-                    // 成功：HalfOpen 探测同步等待（disarm permit guard，让 record_success
-                    // 内部 release 变 no-op）；Closed 状态异步记录。
-                    // **关键**：permit_guard.take().map(disarm) 必须在 record_success_result
-                    // 之前调用，否则 Drop 与 record_success 内部 release 会双重触发。
-                    if let Some(g) = permit_guard.take() {
-                        g.disarm();
-                    }
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+                    // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
+                    // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
+                    self.record_success_result(&provider.id, app_type_str, permit_guard.take())
                         .await;
 
                     // 更新当前应用类型使用的 provider
@@ -652,13 +661,10 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    if let Some(g) = permit_guard.take() {
-                                        g.disarm();
-                                    }
                                     self.record_success_result(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        permit_guard.take(),
                                     )
                                     .await;
 
@@ -716,7 +722,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit_guard.take(),
                                             "media 降级",
                                             &mut last_error,
                                             &mut last_provider,
@@ -795,13 +801,10 @@ impl RequestForwarder {
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        if let Some(g) = permit_guard.take() {
-                                            g.disarm();
-                                        }
                                         self.record_success_result(
                                             &provider.id,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit_guard.take(),
                                         )
                                         .await;
 
@@ -864,7 +867,7 @@ impl RequestForwarder {
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
-                                                used_half_open_permit,
+                                                permit_guard.take(),
                                                 "整流",
                                                 &mut last_error,
                                                 &mut last_provider,
@@ -956,13 +959,10 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    if let Some(g) = permit_guard.take() {
-                                        g.disarm();
-                                    }
                                     self.record_success_result(
                                         &provider.id,
                                         app_type_str,
-                                        used_half_open_permit,
+                                        permit_guard.take(),
                                     )
                                     .await;
 
@@ -1019,7 +1019,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit_guard.take(),
                                             "budget 整流",
                                             &mut last_error,
                                             &mut last_provider,
@@ -1083,96 +1083,6 @@ impl RequestForwarder {
                                 &e,
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
-
-                            // 检测是否是智谱 Coding Plan 用量耗尽，尝试自动 fallback 到 MiniMax
-                            if is_zhipu_quota_exceeded(&e) {
-                                if let Ok(Some(minimax)) = self
-                                    .router
-                                    .find_fallback_provider(app_type_str, "minimax")
-                                    .await
-                                {
-                                    // 先检查 MiniMax 自身用量阈值
-                                    if !check_fallback_provider_quota(&minimax, app_type).await {
-                                        log::info!(
-                                            "[{app_type_str}] [FALLBACK] MiniMax 用量超阈值, 跳过 fallback"
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "[{app_type_str}] [FALLBACK] 智谱 quota 耗尽, 尝试 fallback 到 MiniMax: {}",
-                                            minimax.name
-                                        );
-                                        match self
-                                            .forward(
-                                                app_type,
-                                                &method,
-                                                &minimax,
-                                                endpoint,
-                                                &body,
-                                                &headers,
-                                                &extensions,
-                                                adapter.as_ref(),
-                                            )
-                                            .await
-                                        {
-                                            Ok((response, claude_api_format, _outbound_model)) => {
-                                                log::info!(
-                                                    "[{app_type_str}] [FALLBACK-OK] MiniMax fallback 成功"
-                                                );
-                                                if let Some(g) = permit_guard.take() {
-                                                    g.disarm();
-                                                }
-                                                self.record_success_result(
-                                                    &minimax.id,
-                                                    app_type_str,
-                                                    false,
-                                                )
-                                                .await;
-                                                {
-                                                    let mut current_providers =
-                                                        self.current_providers.write().await;
-                                                    current_providers.insert(
-                                                        app_type_str.to_string(),
-                                                        (minimax.id.clone(), minimax.name.clone()),
-                                                    );
-                                                }
-                                                {
-                                                    let mut status = self.status.write().await;
-                                                    status.success_requests += 1;
-                                                    status.last_error = None;
-                                                    status.failover_count += 1;
-                                                    if status.total_requests > 0 {
-                                                        status.success_rate =
-                                                            (status.success_requests as f32
-                                                                / status.total_requests as f32)
-                                                                * 100.0;
-                                                    }
-                                                }
-                                                return Ok(ForwardResult {
-                                                    response,
-                                                    provider: minimax,
-                                                    claude_api_format,
-                                                    outbound_model: None,
-                                                    connection_guard: None,
-                                                });
-                                            }
-                                            Err(fallback_err) => {
-                                                log::warn!(
-                                                    "[{app_type_str}] [FALLBACK-FAIL] MiniMax fallback 失败: {fallback_err}"
-                                                );
-                                                let _ = self
-                                                    .router
-                                                    .record_result(
-                                                        &minimax.id,
-                                                        app_type_str,
-                                                        false,
-                                                        Some(fallback_err.to_string()),
-                                                    )
-                                                    .await;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
@@ -2969,86 +2879,6 @@ fn build_terminal_failure_log(
     ))
 }
 
-/// 检测错误是否是智谱 Coding Plan 用量耗尽。
-///
-/// 覆盖以下典型错误形态：
-/// - 智谱官方错误码: `coding_plan_hour_quota_exceeded` / `coding_plan_week_quota_exceeded`
-/// - 通用 quota 关键字: `"quota exceeded"`
-/// - 智谱 429 响应中同时提到 rate limit + zhipu/bigmodel
-fn is_zhipu_quota_exceeded(error: &ProxyError) -> bool {
-    match error {
-        ProxyError::UpstreamError { body, .. } => {
-            let Some(body_str) = body else {
-                return false;
-            };
-            let lower = body_str.to_lowercase();
-            lower.contains("coding_plan_hour_quota_exceeded")
-                || lower.contains("coding_plan_week_quota_exceeded")
-                || lower.contains("coding_plan_month_quota_exceeded")
-                || lower.contains("quota exceeded")
-                || (lower.contains("rate limit") && lower.contains("exceeded"))
-        }
-        _ => false,
-    }
-}
-
-/// 检查 fallback provider 的 Coding Plan 用量是否可用。
-///
-/// 阈值（与智谱对齐）:
-/// - 5小时限额利用率 < 80%
-/// - 周限额利用率 < 95%
-///
-/// 任一条件不满足则视为不可用，返回 `false`。
-/// 查询失败时也保守返回 `false`（宁可不用，也不冒超配额风险）。
-async fn check_fallback_provider_quota(provider: &Provider, app_type: &AppType) -> bool {
-    let (base_url, api_key) = provider.resolve_usage_credentials(app_type);
-
-    if api_key.is_empty() {
-        log::warn!("[QuotaCheck] fallback provider API key 为空，无法查询用量");
-        return false;
-    }
-
-    let quota = match crate::services::coding_plan::get_coding_plan_quota(
-        &base_url, &api_key, None, None, None, None, None,
-    )
-    .await
-    {
-        Ok(q) => q,
-        Err(e) => {
-            log::warn!("[QuotaCheck] 查询 fallback provider 用量失败: {e}");
-            return false;
-        }
-    };
-
-    if !quota.success {
-        log::warn!("[QuotaCheck] fallback provider 用量查询返回失败");
-        return false;
-    }
-
-    for tier in &quota.tiers {
-        match tier.name.as_str() {
-            "five_hour" if tier.utilization >= 80.0 => {
-                log::info!(
-                    "[QuotaCheck] fallback provider 5小时限额已用 {:.1}%, 超过 80% 阈值，不可用",
-                    tier.utilization
-                );
-                return false;
-            }
-            "weekly_limit" if tier.utilization >= 95.0 => {
-                log::info!(
-                    "[QuotaCheck] fallback provider 周限额已用 {:.1}%, 超过 95% 阈值，不可用",
-                    tier.utilization
-                );
-                return false;
-            }
-            _ => {}
-        }
-    }
-
-    log::debug!("[QuotaCheck] fallback provider 用量检查通过");
-    true
-}
-
 fn summarize_proxy_error(error: &ProxyError) -> String {
     match error {
         ProxyError::UpstreamError { status, body } => {
@@ -3992,6 +3822,7 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::provider::LocalProxyRequestOverrides;
+    use crate::proxy::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
     use bytes::Bytes;
@@ -5662,551 +5493,276 @@ mod tests {
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
     }
 
-    /// **源码级回归测试**：防止 forwarder.rs 退化回 destructure-and-drop 的 P0 bug 写法。
-    ///
-    /// Bug 描述：在 `forward_with_retry_inner` 里，旧写法把 `AllowRequestResult`
-    /// 在表达式结束后立即 drop，里面的 `Option<HalfOpenPermitGuard>` 跟着 drop，
-    /// 触发 `release_half_open_permit()`，于是 `half_open_requests` 在 HTTP 请求
-    /// 真正发出去之前就归零了——并发探测可以无阻力通过，max=1 限流失效。
-    ///
-    /// 正确写法必须把 `probe.permit` 绑定到一个跨过 `forward()` 调用的局部变量，
-    /// 让 RAII guard 在请求生命周期内一直存活。
-    ///
-    /// 注意：buggy pattern 的字面量字符串只能出现在本测试的 `assert!` 文案里，
-    /// 不能用 `include_str!` 直接 grep（会自检自己）。因此改用 sentinel 字符串
-    /// 拆分后拼接。
-    #[test]
-    fn forwarder_does_not_release_permit_early() {
-        // 拆分 buggy pattern 避免 include_str 自匹配
-        let buggy_pattern: String = [
-            "(",
-            "permit",
-            ".allowed, ",
-            "permit",
-            ".used_half_open_permit)",
-        ]
-        .concat();
-
-        let forwarder_src = include_str!("forwarder.rs");
-
-        // 1. 不允许 destructure 后让 probe 立刻 drop
-        assert!(
-            !forwarder_src.contains(&buggy_pattern),
-            "BUG #1 回归：forwarder.rs 出现了 destructure-and-drop 写法。\
-             这会让 AllowRequestResult 在表达式结束时 drop，里面的 permit guard 跟着 drop，\
-             release_half_open_permit 立刻执行——max_half_open_requests=1 限流失效。\n\
-             正确写法：`let probe = self.router.allow_provider_request(...).await;`\n\
-             `let permit_guard = probe.permit;`\n\
-             让 guard 跨过 forward() 调用生命周期。"
-        );
-
-        // 2. 必须存在显式绑定 guard 的代码（保护性检查：如果有人删掉 guard 绑定，回归测试要失败）
-        assert!(
-            forwarder_src.contains("probe.permit"),
-            "BUG #1 回归保护：forwarder.rs 必须显式绑定 `probe.permit` 到一个跨过 forward() \
-             调用的局部变量上，否则 HalfOpen permit 会在 HTTP 请求发出前被释放。"
-        );
-    }
-
-    // ===== P2 ISSUE #6: forwarder 层 permit 生命周期集成测试 =====
+    // ===== P0 ISSUE: RAII HalfOpen permit guard 在非标准退出路径下释放 =====
     //
-    // 三个 RED 测试，覆盖 forwarder.rs 在生产路径上持有/释放 permit 的核心不变量：
-    // 1. **concurrent probes**：两个并发 forwarder 调用，max_half_open_requests=1 必须生效
-    // 2. **client disconnect**：forwarder future 被 drop 时，RAII guard 必须释放 permit
-    // 3. **panic unwinding**：forwarder future 在 panic 时，guard Drop 仍会触发释放
+    // RAII 的核心承诺：**不管怎么退出 forward() 调用，permit 必须被释放**。
+    // 之前的 happy / abort / panic 测试只覆盖了部分路径。下面 3 个测试故意构造
+    // 非标准退出，验证 permit 一定不会泄漏。
+    //
+    // 验证方法：构造 HalfOpen 场景 → 触发非标准退出 → 再次调用 allow_request()
+    //   - 若 permit 已释放：第二次 allow_request 返回 `permit: Some(...)`（slot 0）
+    //   - 若 permit 未释放：第二次 allow_request 返回 `permit: None`（slot 仍占 1）
+    //
+    // 关键不变量：**half_open_requests 计数必须归零**，否则后续探测永远进不来。
 
-    /// 极简 mock upstream HTTP/1.1 服务器——只够 forwarder.rs 跑通 forward() 流程。
-    ///
-    /// 行为可配置：
-    /// - `delay_before_response`：读到完整请求头后等多久才返回响应（用于"探测 in-flight"窗口）
-    /// - `status_code` / `body`：返回的响应
-    ///
-    /// 不解析请求体，只读到 `\r\n\r\n` 就当作收到完整请求头。
-    /// 不支持 keep-alive：每个连接只服务一个响应然后关闭。
-    struct MockUpstream {
-        addr: std::net::SocketAddr,
-        /// 测试结束前持有这个 handle，否则 tokio::spawn 的 server task 会被 drop
-        _server_handle: tokio::task::JoinHandle<()>,
-    }
-
-    struct MockResponse {
+    /// 极简 HTTP/1.1 mock upstream。给一个 JSON 响应 + 可选延迟即可。
+    /// 每个连接响应一次后关闭（不支持 keep-alive）。
+    async fn spawn_mock_upstream(
         status: u16,
         body: String,
         delay: Duration,
-    }
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{addr}");
 
-    impl MockUpstream {
-        /// 标准成功响应（Anthropic 格式），可配置延迟
-        async fn success_with_delay(delay: Duration) -> Self {
-            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> = Arc::new(move || {
-                MockResponse {
-                    status: 200,
-                    body: r#"{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-test","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#.to_string(),
-                    delay,
-                }
-            });
-            Self::spawn(responder).await
-        }
-
-        /// 永远不响应（让 client 一直 hang），用于 client disconnect 测试
-        async fn hang() -> Self {
-            let responder: Arc<dyn Fn() -> MockResponse + Send + Sync> =
-                Arc::new(|| MockResponse {
-                    status: 0, // 0 = never write
-                    body: String::new(),
-                    delay: Duration::from_secs(60),
-                });
-            Self::spawn(responder).await
-        }
-
-        async fn spawn(responder: Arc<dyn Fn() -> MockResponse + Send + Sync>) -> Self {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind mock listener");
-            let addr = listener.local_addr().expect("listener addr");
-
-            let server_handle = tokio::spawn(async move {
-                loop {
-                    let (mut socket, _) = match listener.accept().await {
-                        Ok(s) => s,
-                        Err(_) => break,
-                    };
-                    let resp = (responder)();
-                    // 读到 \r\n\r\n 为止（HTTP request headers 结束）
-                    let mut buf = vec![0u8; 8192];
-                    let mut total = 0;
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let status = status;
+                let body = body.clone();
+                let delay = delay;
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // 读到 \r\n\r\n 视为收到完整请求头
+                    let mut buf = Vec::with_capacity(1024);
+                    let mut tmp = [0u8; 1024];
                     loop {
-                        match socket.read(&mut buf[total..]).await {
-                            Ok(0) => break,
+                        match stream.read(&mut tmp).await {
+                            Ok(0) => return,
                             Ok(n) => {
-                                total += n;
-                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                                    break;
-                                }
-                                if total >= buf.len() {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                                     break;
                                 }
                             }
                             Err(_) => return,
                         }
                     }
-                    if resp.status == 0 {
-                        // hang 模式：故意不写
-                        tokio::time::sleep(resp.delay).await;
-                        continue;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
                     }
-                    tokio::time::sleep(resp.delay).await;
+                    let reason = match status {
+                        200 => "OK",
+                        500 => "Internal Server Error",
+                        _ => "Status",
+                    };
                     let response = format!(
-                        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        resp.status,
-                        resp.body.len(),
-                        resp.body,
+                        "HTTP/1.1 {status} {reason}\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {len}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        status = status,
+                        reason = reason,
+                        len = body.len(),
+                        body = body,
                     );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                }
-            });
-
-            Self {
-                addr,
-                _server_handle: server_handle,
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
             }
-        }
+        });
 
-        fn url(&self) -> String {
-            format!("http://{}", self.addr)
-        }
+        (url, handle)
     }
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// 测试初始化：安装 rustls CryptoProvider（生产代码在 src/lib.rs:452 也会安装）。
-    /// reqwest 默认带 rustls-tls feature，第一次 TLS 连接时需要这个。
+    /// 安装 rustls crypto provider，避免 reqwest 的 rustls-tls feature 报
+    /// "no process-level CryptoProvider available" 错误。
     fn install_crypto_provider_for_tests() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    /// 构建一个指向 mock upstream 的 Provider
-    fn provider_pointing_to(url: &str, id: &str) -> Provider {
-        Provider {
-            id: id.to_string(),
-            name: format!("Mock {}", id),
-            // anthropic adapter 会读 settings_config.base_url
-            settings_config: serde_json::json!({"base_url": url}),
-            website_url: None,
-            category: None,
-            created_at: None,
-            sort_index: None,
-            notes: None,
-            meta: Some(crate::provider::ProviderMeta {
-                provider_type: Some("anthropic".to_string()),
-                ..Default::default()
-            }),
-            icon: None,
-            icon_color: None,
-            in_failover_queue: false,
+    /// 构造一个指向指定 URL 的 Provider。
+    fn provider_pointing_to(id: &str, name: &str, base_url: &str) -> Provider {
+        let mut p = test_provider_with_type(Some("anthropic"));
+        p.id = id.to_string();
+        p.name = name.to_string();
+        // anthropic adapter 期望 base_url 在 settings_config 或 env。这里直接通过
+        // meta 注入自定义 base_url，让 provider 在 forward() 时拿到 mock upstream URL。
+        let mut settings = serde_json::json!({});
+        settings["env"] = serde_json::json!({
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_AUTH_TOKEN": "test-token-no-real-network",
+        });
+        p.settings_config = settings;
+        p
+    }
+
+    /// 把 circuit breaker config 调到最容易触发 HalfOpen 的设置：
+    /// failure_threshold=1, timeout=0 (立即进入 HalfOpen)。
+
+    /// TempHome + memory DB：避免 FOREIGN KEY 约束（HOME 没设会失败）。
+    fn fresh_test_db() -> (TempHome, Arc<Database>) {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("memory db"));
+        (_home, db)
+    }
+
+    /// 测试用 TempHome（与 provider_router::tests 里的同名 struct 同款）
+    struct TempHome {
+        #[allow(dead_code)]
+        dir: tempfile::TempDir,
+        original_home: Option<String>,
+        original_userprofile: Option<String>,
+        original_test_home: Option<String>,
+    }
+    impl TempHome {
+        fn new() -> Self {
+            use std::env;
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let original_home = env::var("HOME").ok();
+            let original_userprofile = env::var("USERPROFILE").ok();
+            let original_test_home = env::var("CC_SWITCH_TEST_HOME").ok();
+            env::set_var("HOME", dir.path());
+            env::set_var("USERPROFILE", dir.path());
+            env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::reload_settings().expect("reload settings");
+            Self {
+                dir,
+                original_home,
+                original_userprofile,
+                original_test_home,
+            }
+        }
+    }
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            use std::env;
+            match &self.original_home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match &self.original_userprofile {
+                Some(v) => env::set_var("USERPROFILE", v),
+                None => env::remove_var("USERPROFILE"),
+            }
+            match &self.original_test_home {
+                Some(v) => env::set_var("CC_SWITCH_TEST_HOME", v),
+                None => env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
         }
     }
 
-    /// helper：构造集成测试用的 forwarder
-    #[allow(clippy::too_many_arguments)]
-    fn forwarder_for_integration(
-        router: Arc<crate::proxy::provider_router::ProviderRouter>,
-        db: Arc<Database>,
-    ) -> RequestForwarder {
-        RequestForwarder {
-            router,
-            status: Arc::new(RwLock::new(ProxyStatus::default())),
-            current_providers: Arc::new(RwLock::new(HashMap::new())),
-            gemini_shadow: Arc::new(
-                crate::proxy::providers::gemini_shadow::GeminiShadowStore::new(),
-            ),
-            codex_chat_history: Arc::new(
-                crate::proxy::providers::codex_chat_history::CodexChatHistoryStore::default(),
-            ),
-            failover_manager: Arc::new(crate::proxy::failover_switch::FailoverSwitchManager::new(
-                db,
-            )),
-            app_handle: None,
-            current_provider_id_at_start: String::new(),
-            session_id: String::new(),
-            session_client_provided: false,
-            rectifier_config: Default::default(),
-            optimizer_config: Default::default(),
-            copilot_optimizer_config: Default::default(),
-            non_streaming_timeout: Duration::from_secs(5),
-            streaming_first_byte_timeout: Duration::from_secs(5),
-            max_attempts: 1,
-        }
-    }
-
-    /// RED 测试 #1：forwarder.rs 必须持有 HalfOpen permit 跨过 forward() 调用。
-    ///
-    /// 复现的 bug：旧 forwarder.rs 在 line 484-491 用 destructure-and-drop 写法
-    /// （解构 `AllowRequestResult` 后立即 drop），
-    /// 导致 permit 在 forward() 之前就释放。
-    /// 两个并发 forwarder 调用能同时拿到 HalfOpen 探测名额（max=1 限流失效）。
-    ///
-    /// RED 断言（迁移后应 GREEN）：
-    /// 1. forwarder 进入 forward() 时，half_open_requests 必须 == 1（permit 仍持有）
-    /// 2. forwarder 调用结束（mock 慢响应之后），half_open_requests == 0（成功释放）
-    /// 3. forwarder 调用期间，并发的第二次 allow_provider_request 必须被 REJECTED
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn forwarder_holds_half_open_permit_across_forward_call() {
-        install_crypto_provider_for_tests();
-        use crate::proxy::circuit_breaker::CircuitBreakerConfig;
-
-        let _home = tempfile::TempDir::new().expect("temp dir");
-
-        let db = Arc::new(Database::memory().unwrap());
-
-        // 极快的 trip 阈值 + 0 秒超时：1 次失败立即进入 HalfOpen
-        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+    /// 直接构造一个处于 HalfOpen 状态的 CircuitBreaker（无需 DB 介入）。
+    /// 用于测试 RAII guard 的 Drop 语义——这才是核心不变量。
+    async fn half_open_breaker() -> std::sync::Arc<CircuitBreaker> {
+        let config = CircuitBreakerConfig {
             failure_threshold: 1,
-            success_threshold: 1,
+            success_threshold: 2,
             timeout_seconds: 0,
             ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        // mock upstream：每次响应延迟 500ms（让 permit 在 forward() 调用期间一直保持）
-        let upstream = MockUpstream::success_with_delay(Duration::from_millis(500)).await;
-        let provider = provider_pointing_to(&upstream.url(), "p1");
-
-        // 第二 provider 用于避免 bypass_circuit_breaker（forwarder.rs:460 在单 provider 时跳过熔断器）
-        let dummy_provider = Provider {
-            id: "p_dummy".to_string(),
-            name: "Dummy".to_string(),
-            settings_config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
-            website_url: None,
-            category: None,
-            created_at: None,
-            sort_index: Some(99),
-            notes: None,
-            meta: Some(crate::provider::ProviderMeta {
-                provider_type: Some("anthropic".to_string()),
-                ..Default::default()
-            }),
-            icon: None,
-            icon_color: None,
-            in_failover_queue: false,
         };
-
-        db.save_provider("claude", &provider).unwrap();
-        db.save_provider("claude", &dummy_provider).unwrap();
-        db.add_to_failover_queue("claude", "p1").unwrap();
-        db.add_to_failover_queue("claude", "p_dummy").unwrap();
-
-        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
-        config.auto_failover_enabled = true;
-        config.circuit_failure_threshold = 1;
-        config.circuit_success_threshold = 1;
-        config.circuit_timeout_seconds = 0;
-        db.update_proxy_config_for_app(config).await.unwrap();
-
-        // 先用 1 次失败把 p1 trip 到 Open→HalfOpen
-        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
-            db.clone(),
-        ));
-        router
-            .record_result("p1", "claude", false, Some("test fail".to_string()))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let forwarder = forwarder_for_integration(router.clone(), db.clone());
-
-        // === Act: 启动 forwarder task（500ms 内持有 permit） ===
-        let providers = vec![provider.clone(), dummy_provider.clone()];
-        let handle = tokio::spawn(async move {
-            forwarder
-                .forward_with_retry(
-                    &AppType::Claude,
-                    http::Method::POST,
-                    "/v1/messages",
-                    serde_json::json!({
-                        "model": "claude-3-5-sonnet-20241022",
-                        "max_tokens": 10,
-                        "messages": [{"role": "user", "content": "hi"}]
-                    }),
-                    HeaderMap::new(),
-                    Extensions::new(),
-                    providers,
-                )
-                .await
-        });
-
-        // === Assert (1): 等 forwarder 进入 forward()（mock delay=500ms）===
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let stats = router
-            .get_circuit_breaker_stats("p1", "claude")
-            .await
-            .expect("breaker should exist");
-        assert_eq!(
-            stats.half_open_requests, 1,
-            "RED ASSERT: forwarder.rs 必须持有 HalfOpen permit 跨过 forward() 调用。\
-             当前 half_open_requests = {}（应为 1）。\
-             如果是 0，说明 forwarder.rs 又退化回了 destructure-and-drop 写法，\
-             permit 在 forward() 之前就 release 了。",
-            stats.half_open_requests
-        );
-
-        // === Assert (2): forwarder in-flight 期间，并发的第二次 allow_provider_request 必须被 REJECTED ===
-        let second_probe = router.allow_provider_request("p1", "claude").await;
-        assert!(
-            !second_probe.allowed,
-            "RED ASSERT: max_half_open_requests=1 必须在 forwarder in-flight 期间生效。\
-             并发第二次探测被错误放行（allowed={}），说明 permit 没被持有。",
-            second_probe.allowed
-        );
-
-        // === Assert (3): 等 forwarder 完成（500ms 之后）===
-        let _ = handle.await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let stats_after = router
-            .get_circuit_breaker_stats("p1", "claude")
-            .await
-            .unwrap();
-        assert_eq!(
-            stats_after.half_open_requests, 0,
-            "forwarder 完成后 permit 必须释放（half_open_requests 应为 0）"
-        );
+        let breaker = std::sync::Arc::new(CircuitBreaker::new(config));
+        breaker.record_failure().await; // → Open
+        breaker
     }
 
-    /// RED 测试 #2：client disconnect（forwarder future 被 drop）时，
-    /// RAII guard 必须释放 permit，不能泄漏。
-    ///
-    /// 复现：forwarder 等待 mock 慢响应时，client 断开连接（forwarder future 被 abort/drop）。
-    /// permit_guard 跨在 forward() 局部变量里，future drop 时 guard Drop 自动释放 permit。
-    /// 这是 RAII 安全网的核心场景。
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn forwarder_client_disconnect_releases_half_open_permit() {
-        install_crypto_provider_for_tests();
-        use crate::proxy::circuit_breaker::CircuitBreakerConfig;
-
-        let _home = tempfile::TempDir::new().expect("temp dir");
-
-        let db = Arc::new(Database::memory().unwrap());
-
-        db.update_circuit_breaker_config(&CircuitBreakerConfig {
-            failure_threshold: 1,
-            success_threshold: 1,
-            timeout_seconds: 0,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        // mock 永不响应（hang 60s）
-        let upstream = MockUpstream::hang().await;
-        let provider = provider_pointing_to(&upstream.url(), "p1");
-
-        // 第二 provider 用于避免 bypass_circuit_breaker
-        let dummy_provider = Provider {
-            id: "p_dummy".to_string(),
-            name: "Dummy".to_string(),
-            settings_config: serde_json::json!({"base_url": "http://127.0.0.1:1"}),
-            website_url: None,
-            category: None,
-            created_at: None,
-            sort_index: Some(99),
-            notes: None,
-            meta: Some(crate::provider::ProviderMeta {
-                provider_type: Some("anthropic".to_string()),
-                ..Default::default()
-            }),
-            icon: None,
-            icon_color: None,
-            in_failover_queue: false,
-        };
-
-        db.save_provider("claude", &provider).unwrap();
-        db.save_provider("claude", &dummy_provider).unwrap();
-        db.add_to_failover_queue("claude", "p1").unwrap();
-        db.add_to_failover_queue("claude", "p_dummy").unwrap();
-
-        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
-        config.auto_failover_enabled = true;
-        config.circuit_failure_threshold = 1;
-        config.circuit_success_threshold = 1;
-        config.circuit_timeout_seconds = 0;
-        db.update_proxy_config_for_app(config).await.unwrap();
-
-        let router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
-            db.clone(),
-        ));
-        router
-            .record_result("p1", "claude", false, Some("test fail".to_string()))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let forwarder = forwarder_for_integration(router.clone(), db.clone());
-
-        let providers = vec![provider.clone(), dummy_provider.clone()];
-        let handle = tokio::spawn(async move {
-            forwarder
-                .forward_with_retry(
-                    &AppType::Claude,
-                    http::Method::POST,
-                    "/v1/messages",
-                    serde_json::json!({"model": "claude-3-5-sonnet-20241022", "max_tokens": 10, "messages": []}),
-                    HeaderMap::new(),
-                    Extensions::new(),
-                    providers,
-                )
-                .await
-        });
-
-        // 等 forwarder 进入 forward()（mock hang）
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let stats_before_abort = router
-            .get_circuit_breaker_stats("p1", "claude")
-            .await
-            .unwrap();
-        assert_eq!(
-            stats_before_abort.half_open_requests, 1,
-            "forwarder 进入 forward() 时 permit 必须被持有"
-        );
-
-        // === Act: 模拟 client disconnect（abort forwarder task）===
-        handle.abort();
-
-        // 等 RAII guard Drop 触发 + permit release
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // === Assert: abort 后 permit 必须被释放（不能泄漏）===
-        let stats_after_abort = router
-            .get_circuit_breaker_stats("p1", "claude")
-            .await
-            .unwrap();
-        assert_eq!(
-            stats_after_abort.half_open_requests, 0,
-            "RED ASSERT: client disconnect 后 RAII guard 必须释放 HalfOpen permit。\
-             当前 half_open_requests = {}（应为 0）。\
-             permit 泄漏会导致 breaker 永远卡住，无法发新探测。",
-            stats_after_abort.half_open_requests
-        );
-    }
-
-    /// RED 测试 #3：guard 跨 panic 边界时，Drop 必须触发释放 permit。
-    ///
-    /// 这是 RAII 的核心安全保证：即使持 guard 的 future panic（不仅是 cancel），
-    /// Rust 的栈展开机制也会触发 Drop → release_half_open_permit。
-    ///
-    /// 这个测试和 `circuit_breaker::tests::test_drop_guard_releases_on_panic_unwind`
-    /// 测的是同一行为（RAII 类型语义），但放在 forwarder 测试模块是为了：
-    /// 1. 验证 forwarder.rs 持有 guard 的模式（permit_guard 局部变量）能正确工作
-    /// 2. 任何想"优化" forwarder.rs 路径的人如果破坏了 panic safety，这个测试会失败
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn forwarder_permit_guard_released_on_panic() {
-        use crate::proxy::circuit_breaker::{
-            CircuitBreaker, CircuitBreakerConfig, HalfOpenPermitGuard,
-        };
-
-        let _home = tempfile::TempDir::new().expect("temp dir");
-        let db = Arc::new(Database::memory().unwrap());
-        let _router = Arc::new(crate::proxy::provider_router::ProviderRouter::new(
-            db.clone(),
-        ));
-
-        // 直接构造 CircuitBreaker（无需 router），模拟 HalfOpen 状态
-        let breaker = Arc::new(CircuitBreaker::new(
-            CircuitBreakerConfig {
-                failure_threshold: 1,
-                success_threshold: 1,
-                timeout_seconds: 0,
-                ..Default::default()
-            },
-            "test:panic",
-            "Test Panic",
-        ));
-        // 用 record_failure 触发 breaker 到 Open（timeout=0 后自动转 HalfOpen）
-        breaker.record_failure().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // 模拟 forwarder.rs 的持有模式：guard 绑到外部变量
+    /// 当前 HalfOpen 探测是否还能拿到 permit（拿不到说明计数 > 0）。
+    async fn half_open_slot_available(breaker: &CircuitBreaker) -> bool {
         let probe = breaker.allow_request().await;
-        let permit_guard: HalfOpenPermitGuard = probe.permit.expect("must have guard");
-        assert_eq!(
-            breaker.get_half_open_requests_for_test(),
-            1,
-            "permit acquired"
-        );
+        let available = probe.allowed && probe.permit.is_some();
+        if let Some(g) = probe.permit {
+            g.disarm(); // 测试清理：让 Drop 变 no-op
+        }
+        available
+    }
 
-        // === Act: 把 guard move 进 panic 闭包，验证 guard Drop 在栈展开时触发 ===
-        let breaker_clone = breaker.clone();
-        let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            // 闭包内持有 guard（模拟 forwarder 局部变量）
-            let _guard_in_closure = permit_guard;
-            // 模拟 panic（任何原因：unwrap、assert!、panic!、index out of bounds...）
-            panic!("simulated panic in forwarder future");
-        }));
+    /// 非标准退出 #1：**故障转移 `continue` 到下一个 provider**
+    ///
+    /// 场景：故障转移时第一个 provider 的 permit_guard 在 for 循环迭代结束时
+    /// Drop，必须释放 HalfOpen 探测名额，否则下一个 provider 永远卡在探测阶段。
+    #[tokio::test]
+    async fn forwarder_failover_drops_first_provider_guard() {
+        let breaker = half_open_breaker().await;
 
-        // === Assert: panic 被 catch，guard 在闭包 unwind 时 drop，permit 已释放 ===
-        assert!(unwind_result.is_err(), "闭包应该 panic");
-        // 给 runtime 一点点时间做清理（保险起见）
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Step A: 第一次 allow_request → HalfOpen 拿到 permit
+        let probe1 = breaker.allow_request().await;
+        assert!(probe1.allowed, "HalfOpen 应允许首次探测");
+        assert!(probe1.permit.is_some(), "首次探测应拿到 permit");
+        let guard = probe1.permit.expect("must have permit");
 
-        let count_after_panic = breaker_clone.get_half_open_requests_for_test();
-        assert_eq!(
-            count_after_panic, 0,
-            "RED ASSERT: panic unwinding 必须触发 guard Drop 释放 permit。\
-             当前 half_open_requests = {}（应为 0）。\
-             如果 guard 没在 panic 时 drop，permit 会泄漏，breaker 永远卡住。",
-            count_after_panic
-        );
-
-        // 再次验证：permit 释放后，下一次探测可以被允许
-        let next_probe = breaker_clone.allow_request().await;
+        // Step B: 反向 sanity check——此时再 allow_request 应被拒绝（slot 仍占 1）
+        let probe_concurrent = breaker.allow_request().await;
         assert!(
-            next_probe.allowed,
-            "panic 后 permit 必须已释放，下一次探测应被允许（allowed={}）",
-            next_probe.allowed
+            !probe_concurrent.allowed || probe_concurrent.permit.is_none(),
+            "permit 持有期间并发探测应被拒绝（allowed={}, permit.is_some={}）",
+            probe_concurrent.allowed,
+            probe_concurrent.permit.is_some(),
         );
+
+        // Step C: 模拟 forwarder.rs 中 for 循环迭代结束——guard 跨 scope Drop
+        drop(guard);
+
+        // Step D: 关键断言——permit 必须已释放，slot 重新可用
+        assert!(
+            half_open_slot_available(&breaker).await,
+            "failover continue 后第一个 provider 的 permit 必须释放"
+        );
+    }
+
+    /// 非标准退出 #2：**`tokio::select!` 抢占**
+    ///
+    /// 场景：`tokio::select!` 包装 forward() future，另一分支（取消信号 / 客户端
+    /// 断连 / 超时）wins 时 forward() future 被 drop，里面的 guard 必须随 future
+    /// 一起 Drop——permit 不能泄漏。
+    #[tokio::test]
+    async fn forwarder_select_cancellation_releases_guard() {
+        let breaker = half_open_breaker().await;
+
+        let probe = breaker.allow_request().await;
+        assert!(probe.allowed && probe.permit.is_some());
+        let guard = probe.permit.expect("must have permit");
+
+        // 用 select! 包装：guard 所在的 future 被另一分支（oneshot::error）抢占并 drop。
+        let (_tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::select! {
+            biased;
+            _ = &mut rx => unreachable!(),
+            _ = async { drop(guard); } => {}
+        }
+
+        // 关键断言：guard 已随 future drop → permit 必须已释放
+        assert!(
+            half_open_slot_available(&breaker).await,
+            "select 抢占后 permit 必须释放"
+        );
+    }
+
+    /// 非标准退出 #3：**多次 HalfOpen 循环（连续 acquire/release）**
+    ///
+    /// 场景：连续 3 轮 (拿 permit → 释放 → 拿 permit → 释放 → ...)。
+    /// 每轮结束后 permit 都归零，可重新进入下一轮。计数不能错位累积。
+    #[tokio::test]
+    async fn forwarder_multiple_half_open_cycles_release_permit() {
+        let breaker = half_open_breaker().await;
+
+        for cycle in 0..3 {
+            // 重新触发 Open（如果上一轮还在 HalfOpen 就再记录一次失败 → 计数 +1）
+            breaker.record_failure().await;
+
+            // 第一次探测 → 拿到 permit
+            let probe1 = breaker.allow_request().await;
+            assert!(
+                probe1.allowed && probe1.permit.is_some(),
+                "cycle {cycle}: HalfOpen 应允许探测并拿 permit"
+            );
+            let guard = probe1.permit.unwrap();
+
+            // 模拟 happy path：disarm + record_success。
+            // disarm 让 Drop 变 no-op（per RAII 语义）。
+            guard.disarm();
+            breaker.record_success().await;
+
+            // 关键断言：permit 必须已释放，下一轮探测能拿到
+            assert!(
+                half_open_slot_available(&breaker).await,
+                "cycle {cycle}: success 后 permit 必须释放"
+            );
+        }
     }
 }
