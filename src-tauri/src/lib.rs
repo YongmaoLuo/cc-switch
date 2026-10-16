@@ -61,6 +61,8 @@ pub use mcp::{
 };
 pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
+pub use remote::config::{NativeConfirmation, BIND_SCOPE_CONFIRM_EVENT};
+pub use remote::{BindScope, CorsMode, ManagedRemoteServer, RemoteConfig};
 pub use services::{
     profile::{ProfilePayload, ProfileScope, ProfileService},
     provider::reapply_current_codex_official_live,
@@ -1140,6 +1142,9 @@ pub fn run() {
                     enabled: app_settings.remote_enabled,
                     port: app_settings.remote_port,
                     tailscale_enabled: app_settings.remote_tailscale_enabled,
+                    // 暴露边界不从 settings 进来：绑定范围只经两段式原生确认变更，
+                    // CORS/白名单只经 `set_remote_config` 写进 gate。
+                    ..Default::default()
                 };
 
                 // 注入空的 ManagedRemoteServer，供后续命令使用
@@ -1410,6 +1415,21 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // 远程服务一族（12 条，既有 5 + 审批 4 + 配置 3）：
+            // 生命周期 5 条、审批 4 条、对外暴露边界 3 条（读 / 改 CORS 与白名单，
+            // 以及两段式绑定范围里「点火」的那一段）。
+            commands::start_remote_server,
+            commands::stop_remote_server,
+            commands::restart_remote_server,
+            commands::check_tailscale_available,
+            commands::get_tailscale_ip,
+            commands::approve_pairing,
+            commands::reject_pairing,
+            commands::list_paired_clients,
+            commands::revoke_client,
+            commands::get_remote_config,
+            commands::set_remote_config,
+            commands::request_bind_scope_change,
             commands::get_providers,
             commands::get_current_provider,
             commands::add_provider,
@@ -2317,6 +2337,32 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
     remove_tray_icon_before_exit(app_handle);
     destroy_single_instance_lock(app_handle);
     tauri::process::restart(&app_handle.env());
+}
+
+/// 远程命令族的 handler，供行为级闸门在 Tauri IPC 层真调一遍。
+///
+/// **不是**测试自己另写的一份清单：这里登记的就是 `run()` 里那一批命令函数本身
+/// （同一个 `#[tauri::command]` 包装、同一份签名），命令签名一改，这里编不过。
+/// 有了它，`set_remote_config` 才能以它的真实签名接收对抗载荷 ——
+/// 「读源码看形参」那种判据证明不了渲染层真的越不过去。
+///
+/// 少了 `start` / `restart` / `stop_remote_server` 三条：它们走
+/// `remote::start_remote`，那条路要真绑网卡，而 `RemoteApp` / `AppHandleSink`
+/// 持有的是 Wry 专属的 `AppHandle`。审批那两条同理由 `AppHandle<Wry>` 钉死 ——
+/// 它们没跟着泛型化，是为了让 `commands::remote` 里那条读源码的结构锁原封不动。
+/// 其余远程命令（对外暴露边界 3 条 + 两个无 app 形参的 tailscale 查询 +
+/// 客户端管理 2 条）整族都在。
+pub fn remote_invoke_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        commands::check_tailscale_available,
+        commands::get_tailscale_ip,
+        commands::list_paired_clients,
+        commands::revoke_client,
+        commands::get_remote_config,
+        commands::set_remote_config,
+        commands::request_bind_scope_change,
+    ]
 }
 
 #[cfg(test)]

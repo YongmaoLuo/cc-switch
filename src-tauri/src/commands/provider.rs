@@ -1111,32 +1111,8 @@ mod import_claude_desktop_tests {
 mod native_query_credentials_tests {
     use super::resolve_native_credentials;
     use crate::app_config::AppType;
-    use crate::provider::{Provider, UsageScript};
+    use crate::provider::Provider;
     use serde_json::json;
-
-    fn usage_script(
-        coding_plan_provider: Option<&str>,
-        base_url: Option<&str>,
-        api_key: Option<&str>,
-    ) -> UsageScript {
-        UsageScript {
-            enabled: true,
-            language: "javascript".to_string(),
-            code: String::new(),
-            timeout: Some(10),
-            api_key: api_key.map(str::to_string),
-            base_url: base_url.map(str::to_string),
-            access_token: None,
-            user_id: None,
-            template_type: Some("token_plan".to_string()),
-            auto_query_interval: None,
-            coding_plan_provider: coding_plan_provider.map(str::to_string),
-            access_key_id: None,
-            secret_access_key: None,
-            team_organization_id: None,
-            team_project_id: None,
-        }
-    }
 
     #[test]
     fn delegates_to_provider_for_codex() {

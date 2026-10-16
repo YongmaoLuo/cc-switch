@@ -677,6 +677,14 @@ fn handle_provider_click(
         ))
         .map_err(AppError::Message)?;
 
+        // switch_provider 会带回 warnings（例如某个配置文件没能同步）。托盘点
+        // 选没有前端可以渲染这些提示，之前直接丢弃：切换看起来成功，而警告只
+        // 存在于返回值里，再无其他人读得到。这里按同文件 handle_profile_click
+        // 的做法逐条落日志，而不是把结果改名成 `_` 把问题盖住。
+        for warning in &switch_result.warnings {
+            log::warn!("[Tray] 切换供应商 {provider_id} 警告: {warning}");
+        }
+
         // 更新托盘菜单
         if let Ok(new_menu) = create_tray_menu(app, app_state.inner()) {
             if let Some(tray) = app.tray_by_id(TRAY_ID) {

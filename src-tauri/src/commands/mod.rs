@@ -61,6 +61,7 @@ pub use profile::*;
 pub use prompt::*;
 pub use provider::*;
 pub use proxy::*;
+pub use remote::*;
 pub use session_manager::*;
 pub use settings::*;
 pub use skill::*;

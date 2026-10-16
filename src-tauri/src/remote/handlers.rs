@@ -1,13 +1,17 @@
 //! Axum handlers for the remote management API
 
+use super::auth::SessionAudience;
 use super::html::REMOTE_HTML;
+use super::redact;
 use super::RemoteState;
 use crate::app_config::AppType;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::commands::{self, CopilotAuthState};
+use crate::proxy::providers::copilot_auth::CopilotAuthManager;
+use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::services::{ProviderService, ProviderSortUpdate};
 use crate::store::AppState;
-use axum::extract::State as AxumState;
+use axum::extract::{Extension, State as AxumState};
 use axum::http::header;
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Json};
@@ -18,7 +22,7 @@ use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 const REMOTE_APP: AppType = AppType::Claude;
 
@@ -36,8 +40,113 @@ pub struct ReorderRequest {
     pub before_id: String,
 }
 
-fn app_state(state: &RemoteState) -> tauri::State<'_, AppState> {
-    state.app_handle.state::<AppState>()
+/// `app_state()` 的取值结果：两种来源，对调用点一律只暴露 `&AppState`。
+///
+/// - [`AppStateRef::Managed`]：GUI 运行时下 Tauri managed state 的借用，
+///   与本 seam 落地前的语义完全一致。
+/// - [`AppStateRef::Headless`]：无 `AppHandle` 时进程内自持的实例。
+enum AppStateRef<'a> {
+    Managed(tauri::State<'a, AppState>),
+    Headless(&'static AppState),
+}
+
+impl AppStateRef<'_> {
+    fn inner(&self) -> &AppState {
+        match self {
+            Self::Managed(s) => s.inner(),
+            Self::Headless(s) => s,
+        }
+    }
+}
+
+impl std::ops::Deref for AppStateRef<'_> {
+    type Target = AppState;
+
+    fn deref(&self) -> &AppState {
+        self.inner()
+    }
+}
+
+/// 无 `AppHandle` 时使用的自持 `AppState`（headless 接缝）。
+///
+/// 走 [`AppState::new`] 这条生产构造，不另拼一个字段更少的替身 —— 否则
+/// headless 验到的就不是 GUI 真正跑的那套对象，seam 会悄悄漂移。
+///
+/// 数据库用内存库：没有运行时就没有真实的 `~/.cc-switch`，夹具绝不能读用户
+/// 的真实配置。进程内单例（`OnceLock`），因此多个 headless server 共享同一份
+/// 状态，与 Tauri managed state 的单例语义一致。
+///
+/// 只有 `RemoteApp::headless()`（`#[cfg(test)]`）能走到这里，生产构建下
+/// `RemoteApp::inner` 恒为 `Some`，本函数不可达。
+///
+/// `pub(super)` 是为了让 `e2e`（remote 的子模块）能拿到**同一个**实例往里塞
+/// 夹具 provider：E2E 若自建一个 `AppState`，handler 读到的就不是它，验到的
+/// 也就不是生产路径。
+pub(super) fn headless_app_state() -> &'static AppState {
+    static HEADLESS: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
+    HEADLESS.get_or_init(|| {
+        let db = Arc::new(
+            crate::database::Database::memory()
+                .expect("headless remote server requires an in-memory database"),
+        );
+        AppState::new(db)
+    })
+}
+
+/// 取 managed [`AppState`]，headless 下退回到自持实例。
+///
+/// 直接判 `RemoteApp::inner` 而不是走 `Deref`：`Deref` 在无 `AppHandle` 时
+/// 是 `expect` panic，请求会在连接里炸掉。`inner` 是 `remote` 模块内的私有
+/// 字段，而本模块是它的子模块，因此这里读得到、又不必改动 `Deref` 的 GUI
+/// 语义（GUI 分支仍是 `app.state::<AppState>()`）。
+fn app_state(state: &RemoteState) -> AppStateRef<'_> {
+    match state.app_handle.inner.as_ref() {
+        Some(app) => AppStateRef::Managed(app.state::<AppState>()),
+        None => AppStateRef::Headless(headless_app_state()),
+    }
+}
+
+/// 取 Copilot OAuth 状态，headless 下退回到进程内自持实例。
+///
+/// 与 [`app_state`] 同一条接缝，只是换了个状态类型。GUI 分支克隆托管状态里的
+/// `Arc`（与 GUI 共享同一份账号表），headless 分支按 [`RemoteState::config_dir`]
+/// 新建一个 —— 那是夹具的临时目录，headless 用例因此仍不碰用户真实的
+/// `~/.cc-switch`。
+fn copilot_state(state: &RemoteState) -> CopilotAuthState {
+    match state.app_handle.inner.as_ref() {
+        Some(app) => CopilotAuthState(app.state::<CopilotAuthState>().0.clone()),
+        None => CopilotAuthState(Arc::new(tauri::async_runtime::RwLock::new(
+            CopilotAuthManager::new(state.config_dir.clone()),
+        ))),
+    }
+}
+
+/// 取 xAI OAuth 状态，headless 下退回到进程内自持实例。见 [`copilot_state`]。
+fn xai_state(state: &RemoteState) -> XaiOAuthState {
+    match state.app_handle.inner.as_ref() {
+        Some(app) => XaiOAuthState(app.state::<XaiOAuthState>().0.clone()),
+        None => XaiOAuthState(Arc::new(tauri::async_runtime::RwLock::new(
+            XaiOAuthManager::new(state.config_dir.clone()),
+        ))),
+    }
+}
+
+/// 远程错误响应的**唯一**出口。
+///
+/// 签名只收 `Display` 与状态码，**不收已经成型的 `serde_json::Value`**：收
+/// `Value` 就还能写出 `remote_error(OK, json!({"error": e.to_string()}))` 这种
+/// 「先把上游文本拼进 JSON、再假装过了闸门」的调用。顺序错误会重新变得可表达，
+/// 而它正是这道出口要消灭的东西 —— 上一轮在单个分支补 `redact_error` 之所以
+/// 失效，就是同一函数里还有十几处各自拼的 `json!` 分支。
+///
+/// 需要在错误体上追加额外字段（如 `proxy_control` 的 `action`）时用
+/// [`redact::error_json_body`]：同一个出口的 `Value` 形态，脱敏同样在里面强制
+/// 发生，追加只发生在脱敏之后。
+fn remote_error(
+    status: axum::http::StatusCode,
+    detail: impl std::fmt::Display,
+) -> axum::response::Response {
+    redact::error_json(status, detail)
 }
 
 /// GET / — HTML 页面
@@ -71,11 +180,10 @@ pub async fn health_check(AxumState(state): AxumState<Arc<RemoteState>>) -> impl
 /// GET /api/providers
 pub async fn get_providers(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     let app_state = app_state(&state);
@@ -102,18 +210,17 @@ pub async fn get_providers(AxumState(state): AxumState<Arc<RemoteState>>) -> imp
 
             Json(json!({"providers": provider_list})).into_response()
         }
-        Err(e) => Json(json!({"error": e.to_string()})).into_response(),
+        Err(e) => remote_error(axum::http::StatusCode::OK, e),
     }
 }
 
 /// GET /api/current
 pub async fn get_current(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     let app_state = app_state(&state);
@@ -142,15 +249,14 @@ pub async fn switch_provider(
     Json(body): Json<SwitchRequest>,
 ) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     if body.provider_id.is_empty() {
-        return Json(json!({"success": false, "error": "Missing provider_id"})).into_response();
+        return remote_error(axum::http::StatusCode::OK, "Missing provider_id");
     }
 
     let app_state = app_state(&state);
@@ -175,7 +281,7 @@ pub async fn switch_provider(
             let _ = state.sse_tx.send(sse_data.to_string());
 
             // 通知 Tauri 前端刷新（使用与 tray 相同的事件名和格式）
-            let _ = state.app_handle.emit(
+            state.sink.notify_frontend(
                 "provider-switched",
                 json!({
                     "appType": REMOTE_APP.as_str(),
@@ -207,7 +313,7 @@ pub async fn switch_provider(
         }
         Err(e) => {
             log::error!("[Remote] Switch failed: {e}");
-            Json(json!({"success": false, "error": e.to_string()})).into_response()
+            remote_error(axum::http::StatusCode::OK, e)
         }
     }
 }
@@ -221,15 +327,14 @@ pub async fn reorder_providers(
     Json(body): Json<ReorderRequest>,
 ) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     if body.moved_id.is_empty() {
-        return Json(json!({"success": false, "error": "Missing moved_id"})).into_response();
+        return remote_error(axum::http::StatusCode::OK, "Missing moved_id");
     }
 
     let app_state = app_state(&state);
@@ -238,7 +343,7 @@ pub async fn reorder_providers(
     let providers = match ProviderService::list(app_state.inner(), REMOTE_APP) {
         Ok(p) => p,
         Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            return remote_error(axum::http::StatusCode::OK, e);
         }
     };
 
@@ -266,10 +371,10 @@ pub async fn reorder_providers(
     let moved_idx = match moved_idx {
         Some(idx) => idx,
         None => {
-            return Json(
-                json!({"success": false, "error": format!("Provider '{}' not found", body.moved_id)}),
-            )
-            .into_response();
+            return remote_error(
+                axum::http::StatusCode::OK,
+                format!("Provider '{}' not found", body.moved_id),
+            );
         }
     };
 
@@ -311,16 +416,24 @@ pub async fn reorder_providers(
         }
         Err(e) => {
             log::error!("[Remote] Reorder failed: {e}");
-            Json(json!({"success": false, "error": e.to_string()})).into_response()
+            remote_error(axum::http::StatusCode::OK, e)
         }
     }
 }
 
 /// GET /api/events — SSE endpoint
+///
+/// 视图由 [`SessionAudience`] 选择：本机无凭据调用方拿到**降级流**（仍 200、仍能
+/// 收到帧，但切换帧只剩 `type` 与降级标记），持有效凭据的连接逐字拿到全量帧。
+/// 判定格第 7 格要求 loopback 无凭据时可达，所以这里绝不能改成 401。
 pub async fn sse_events(
     AxumState(state): AxumState<Arc<RemoteState>>,
+    audience: Option<Extension<SessionAudience>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.sse_tx.subscribe();
+    // `Option` 兜住没经过鉴权层的调用（单元直调等）。缺档位时按**匿名**处理：
+    // 未知即最小暴露，不能因为少一个 extension 就默认全量透传。
+    let audience = audience.map_or(SessionAudience::AnonymousLoopback, |Extension(a)| a);
 
     let stream = async_stream::stream! {
         loop {
@@ -331,7 +444,10 @@ pub async fn sse_events(
             }
             match rx.recv().await {
                 Ok(data) => {
-                    yield Ok(Event::default().data(data));
+                    // `None` = 这一帧不下发（非法 JSON），跳过它但**不**断流。
+                    if let Some(frame) = project_frame(&data, audience) {
+                        yield Ok(Event::default().data(frame));
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     // Skip lagged messages, continue
@@ -349,6 +465,40 @@ pub async fn sse_events(
             .interval(Duration::from_secs(30))
             .text("ping"),
     )
+}
+
+/// 广播帧里「provider 发生了切换」的帧类型名。
+const SWITCH_FRAME_TYPE: &str = "switch";
+
+/// 把一帧广播载荷投影成 SSE 事件文本；`None` = 这一帧不下发（**不得**因此断流）。
+///
+/// 纯函数：广播扇出、`Lagged`、keep-alive 与断连语义全在调用方，这里只回答
+/// 「这一帧发给这个档位的调用方时长什么样」。
+///
+/// - [`SessionAudience::Authenticated`]：逐字透传，一个字节都不动。
+/// - [`SessionAudience::AnonymousLoopback`]：`switch` 帧按**白名单**重建为
+///   `{"type":"switch","degraded":true}` —— 只留类型与降级标记，`provider_id`
+///   / `name` 等一切供应商细节都不得出现；其余帧类型（`shutdown` 等）原样下发。
+///
+/// 为什么按白名单重建而不是逐个 `remove`：移除清单是**枚举**的，新加一个
+/// `provider_xxx` 字段就会从清单漏出去；白名单是**封闭**的，漏不出去。
+pub fn project_frame(raw: &str, audience: SessionAudience) -> Option<String> {
+    match audience {
+        SessionAudience::Authenticated => Some(raw.to_string()),
+        SessionAudience::AnonymousLoopback => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+                return None;
+            };
+            if value.get("type").and_then(|t| t.as_str()) != Some(SWITCH_FRAME_TYPE) {
+                return Some(raw.to_string());
+            }
+            serde_json::to_string(&json!({
+                "type": SWITCH_FRAME_TYPE,
+                "degraded": true,
+            }))
+            .ok()
+        }
+    }
 }
 
 /// GET /api/icon — 返回 CC Switch 图标 (PNG)
@@ -479,27 +629,31 @@ pub struct ProxyControlRequest {
 
 /// POST /api/proxy/control — 统一控制代理的停止与启动
 ///
-/// Body（可选）：
-///   - `{}` 或缺省                  → 停止代理并恢复 Live 配置
-///   - `{"start": true}`            → 启动代理并接管所有 app 的 Live 配置
-///   - `{"start": false}`           → 停止代理（与默认行为相同）
+/// Body（必填 JSON，必须带 `Content-Type: application/json`）：
+///   - `{}`                          → 停止代理并恢复 Live 配置
+///   - `{"start": true}`             → 启动代理并接管所有 app 的 Live 配置
+///   - `{"start": false}`            → 停止代理（与 `{}` 等价）
+///
+/// 注意：Body 必填（axum `Json` extractor）。不带 `Content-Type: application/json`
+/// 的请求（跨站表单提交、不带 Content-Type 的 `fetch`）会被 415 拒绝，因此这些
+/// CORS 简单请求无法触发 `stop_with_restore()`（它会停代理、清除各 app 的 enabled
+/// 标记并删除 live 备份）——这正是把 extractor 设为必填的原因。
 ///
 /// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
 /// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
 pub async fn proxy_control(
     AxumState(state): AxumState<Arc<RemoteState>>,
-    body: Option<Json<ProxyControlRequest>>,
+    Json(body): Json<ProxyControlRequest>,
 ) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     let app_state = app_state(&state);
-    let start = body.map(|Json(b)| b.start).unwrap_or(false);
+    let start = body.start;
 
     if start {
         // 启动代理 + 接管所有 app 的 Live 配置。
@@ -522,8 +676,9 @@ pub async fn proxy_control(
             }
             Err(e) => {
                 log::error!("[Remote] Failed to start proxy via API: {e}");
-                Json(json!({"success": false, "action": "start", "error": e.to_string()}))
-                    .into_response()
+                let mut body = redact::error_json_body(e);
+                body["action"] = json!("start");
+                Json(body).into_response()
             }
         }
     } else {
@@ -534,8 +689,9 @@ pub async fn proxy_control(
             }
             Err(e) => {
                 log::error!("[Remote] Failed to stop proxy via API: {e}");
-                Json(json!({"success": false, "action": "stop", "error": e.to_string()}))
-                    .into_response()
+                let mut body = redact::error_json_body(e);
+                body["action"] = json!("stop");
+                Json(body).into_response()
             }
         }
     }
@@ -556,11 +712,10 @@ pub async fn proxy_takeover(
     Json(body): Json<ProxyTakeoverRequest>,
 ) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     let app_state = app_state(&state);
@@ -580,7 +735,7 @@ pub async fn proxy_takeover(
         }
         Err(e) => {
             log::error!("[Remote] Failed to set proxy takeover via API: {e}");
-            Json(json!({"success": false, "error": e.to_string()})).into_response()
+            remote_error(axum::http::StatusCode::OK, e)
         }
     }
 }
@@ -602,14 +757,12 @@ pub async fn proxy_failover(
     Json(body): Json<FailoverToggleRequest>,
 ) -> impl IntoResponse {
     use std::str::FromStr;
-    use tauri::Emitter;
 
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     let app_state = app_state(&state);
@@ -620,7 +773,7 @@ pub async fn proxy_failover(
         let mut queue = match app_state.db.get_failover_queue(&body.app_type) {
             Ok(q) => q,
             Err(e) => {
-                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                return remote_error(axum::http::StatusCode::OK, e);
             }
         };
 
@@ -628,10 +781,10 @@ pub async fn proxy_failover(
             let app_enum = match crate::app_config::AppType::from_str(&body.app_type) {
                 Ok(a) => a,
                 Err(_) => {
-                    return Json(
-                        json!({"success": false, "error": format!("无效的应用类型: {}", body.app_type)}),
-                    )
-                    .into_response();
+                    return remote_error(
+                        axum::http::StatusCode::OK,
+                        format!("无效的应用类型: {}", body.app_type),
+                    );
                 }
             };
 
@@ -639,29 +792,28 @@ pub async fn proxy_failover(
                 match crate::settings::get_effective_current_provider(&app_state.db, &app_enum) {
                     Ok(id) => id,
                     Err(e) => {
-                        return Json(json!({"success": false, "error": e.to_string()}))
-                            .into_response();
+                        return remote_error(axum::http::StatusCode::OK, e);
                     }
                 };
 
             let Some(current_id) = current_id else {
-                return Json(
-                    json!({"success": false, "error": "故障转移队列为空，且未设置当前供应商，无法开启故障转移"}),
-                )
-                .into_response();
+                return remote_error(
+                    axum::http::StatusCode::OK,
+                    "故障转移队列为空，且未设置当前供应商，无法开启故障转移",
+                );
             };
 
             if let Err(e) = app_state
                 .db
                 .add_to_failover_queue(&body.app_type, &current_id)
             {
-                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                return remote_error(axum::http::StatusCode::OK, e);
             }
 
             queue = match app_state.db.get_failover_queue(&body.app_type) {
                 Ok(q) => q,
                 Err(e) => {
-                    return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                    return remote_error(axum::http::StatusCode::OK, e);
                 }
             };
         }
@@ -669,10 +821,10 @@ pub async fn proxy_failover(
         match queue.first() {
             Some(item) => item.provider_id.clone(),
             None => {
-                return Json(
-                    json!({"success": false, "error": "故障转移队列为空，无法开启故障转移"}),
-                )
-                .into_response();
+                return remote_error(
+                    axum::http::StatusCode::OK,
+                    "故障转移队列为空，无法开启故障转移",
+                );
             }
         }
     } else {
@@ -683,13 +835,13 @@ pub async fn proxy_failover(
     let mut config = match app_state.db.get_proxy_config_for_app(&body.app_type).await {
         Ok(c) => c,
         Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            return remote_error(axum::http::StatusCode::OK, e);
         }
     };
     config.auto_failover_enabled = body.enabled;
 
     if let Err(e) = app_state.db.update_proxy_config_for_app(config).await {
-        return Json(json!({"success": false, "error": e.to_string()})).into_response();
+        return remote_error(axum::http::StatusCode::OK, e);
     }
 
     // 开启后立即切到 P1
@@ -699,7 +851,7 @@ pub async fn proxy_failover(
             .switch_proxy_target(&body.app_type, &p1_provider_id)
             .await
         {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            return remote_error(axum::http::StatusCode::OK, e);
         }
 
         // 发射 provider-switched 事件
@@ -708,7 +860,7 @@ pub async fn proxy_failover(
             "providerId": p1_provider_id,
             "source": "failoverEnabled"
         });
-        let _ = app.emit("provider-switched", event_data);
+        state.sink.notify_frontend("provider-switched", event_data);
 
         // 广播给远程浏览器（SSE）
         let app_clone = app.clone();
@@ -768,16 +920,18 @@ pub struct ProviderUsageDto {
 /// 拉取每个 provider 官方的 quota 数据（5h/周限额/余额等）并合并为统一 DTO。
 pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl IntoResponse {
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
-    let app_state = state.app_handle.state::<AppState>();
-    let copilot_state = state.app_handle.state::<CopilotAuthState>();
-    let xai_state = state.app_handle.state::<XaiOAuthState>();
+    // 三份状态都走 headless-safe 接缝：直接 `app_handle.state::<T>()` 在无
+    // Tauri 运行时下是 `expect` panic，请求会在连接里炸掉 —— 那样这条路由
+    // 在 E2E 里根本无法被验到（也就无法证明它的错误文本过了脱敏闸门）。
+    let app_state = app_state(&state);
+    let copilot_state = copilot_state(&state);
+    let xai_state = xai_state(&state);
 
     let mut results: Vec<ProviderUsageDto> = Vec::new();
 
@@ -820,8 +974,8 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
 
             let query_result = commands::query_provider_usage_inner(
                 app_state.inner(),
-                copilot_state.inner(),
-                xai_state.inner(),
+                &copilot_state,
+                &xai_state,
                 app_type.clone(),
                 &provider_id,
             )
@@ -837,7 +991,9 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
                         tiers: vec![],
                         updated_at: None,
                         success: false,
-                        error: Some(format!("{e}")),
+                        // usage 脚本的上下文里注入了明文 api_key，脚本一旦回显
+                        // 变量就会逐字带到这里 —— 下发前必须过脱敏闸门。
+                        error: Some(redact::redact_error(&e.to_string())),
                     });
                     continue;
                 }
@@ -855,7 +1011,8 @@ pub async fn get_usage(AxumState(state): AxumState<Arc<RemoteState>>) -> impl In
                     tiers: vec![],
                     updated_at: None,
                     success: false,
-                    error: usage_result.error.clone(),
+                    // 同上：脚本返回的错误文本可能含 key，不能原样下发
+                    error: usage_result.error.as_deref().map(redact::redact_error),
                 });
                 continue;
             }
@@ -918,60 +1075,59 @@ pub async fn test_provider(
     use std::str::FromStr;
 
     if !state.running.load(Ordering::SeqCst) {
-        return (
+        return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"success": false, "error": "Server is stopped"})),
-        )
-            .into_response();
+            "Server is stopped",
+        );
     }
 
     if body.provider_id.is_empty() {
-        return Json(json!({"success": false, "error": "Missing provider_id"})).into_response();
+        return remote_error(axum::http::StatusCode::OK, "Missing provider_id");
     }
 
     let app_type = match AppType::from_str(&body.app_type) {
         Ok(t) => t,
         Err(_) => {
-            return Json(
-                json!({"success": false, "error": format!("无效的应用类型: {}", body.app_type)}),
-            )
-            .into_response();
+            return remote_error(
+                axum::http::StatusCode::OK,
+                format!("无效的应用类型: {}", body.app_type),
+            );
         }
     };
 
     let app_state = app_state(&state);
-    let copilot_state = state.app_handle.state::<CopilotAuthState>();
+    let copilot_state = copilot_state(&state);
 
     // 与 Tauri 命令 stream_check_provider 完全相同的逻辑路径
     let config = match app_state.db.get_stream_check_config() {
         Ok(c) => c,
         Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            return remote_error(axum::http::StatusCode::OK, e);
         }
     };
 
     let providers = match app_state.db.get_all_providers(app_type.as_str()) {
         Ok(p) => p,
         Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            return remote_error(axum::http::StatusCode::OK, e);
         }
     };
 
     let provider = match providers.get(&body.provider_id) {
         Some(p) => p,
         None => {
-            return Json(
-                json!({"success": false, "error": format!("供应商 {} 不存在", body.provider_id)}),
-            )
-            .into_response();
+            return remote_error(
+                axum::http::StatusCode::OK,
+                format!("供应商 {} 不存在", body.provider_id),
+            );
         }
     };
 
     let base_url_override =
-        match commands::resolve_copilot_base_url_override(provider, copilot_state.inner()).await {
+        match commands::resolve_copilot_base_url_override(provider, &copilot_state).await {
             Ok(b) => b,
             Err(e) => {
-                return Json(json!({"success": false, "error": e.to_string()})).into_response();
+                return remote_error(axum::http::StatusCode::OK, e);
             }
         };
 
@@ -985,7 +1141,9 @@ pub async fn test_provider(
     {
         Ok(r) => r,
         Err(e) => {
-            return Json(json!({"success": false, "error": e.to_string()})).into_response();
+            // 上游响应体逐字透传：鉴权失败时它会把请求里的 Authorization /
+            // api_key 片段一起回显出来。远程可见度契约要求这条路径先过脱敏。
+            return remote_error(axum::http::StatusCode::OK, e);
         }
     };
 
@@ -1014,7 +1172,9 @@ pub async fn test_provider(
         "success": true,
         "status": status_str,
         "operational": result.success,
-        "message": result.message,
+        // 失败时 message 装的是上游错误原文（stream_check 里 `e.to_string()`），
+        // 同样逐字下发 —— 与上面的 error 字段走同一道脱敏闸门。
+        "message": redact::redact_error(&result.message),
         "response_time_ms": result.response_time_ms,
         "http_status": result.http_status,
         "model_used": result.model_used,
@@ -1023,4 +1183,340 @@ pub async fn test_provider(
         "error_category": result.error_category,
     }))
     .into_response()
+}
+
+/// `POST /api/proxy/control` 的 CSRF 回归测试。
+///
+/// 覆盖 handler 依赖的 extractor 契约：非 JSON / 缺 Content-Type 的请求（CORS
+/// 简单请求：跨站表单、不带 Content-Type 的 fetch）一律 415，且合法 JSON 调用方
+/// 行为不变（`{}` → 停止，`{"start":true}` → 启动）。
+///
+/// 上面这些用例直接调 `Json` extractor，不经过 `proxy_control` 本体（extractor
+/// rejection 在进入函数体前发生），因此单靠它们锁不住 handler 的签名。缺口由
+/// `proxy_control_takes_required_json_body` 用编译期断言补上：把 body 参数改回
+/// `Option<Json<ProxyControlRequest>>` 会让断言无法编译，整套测试直接构建失败。
+#[cfg(test)]
+mod tests {
+    use super::{project_frame, proxy_control, ProxyControlRequest, RemoteState};
+    use crate::remote::auth::SessionAudience;
+    use axum::body::Body;
+    use axum::extract::{FromRequest, State as AxumState};
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{Request, StatusCode};
+    use axum::response::{IntoResponse, Json, Response};
+    use std::sync::Arc;
+
+    /// 一条真实的 provider 切换广播帧（`switch_provider` / `broadcast_provider_switch` 发的同款）。
+    const SWITCH_FRAME: &str =
+        r#"{"type":"switch","provider_id":"p-secret","name":"Secret Provider"}"#;
+
+    /// 已鉴权连接：帧必须**逐字**透传。
+    ///
+    /// 钉的是「不损失任何东西」——降级投影一旦误伤已鉴权连接，远程 Web UI 会
+    /// 收不到 provider 名，而这类退化在 UI 上只表现为「名字空着」，测试照样可能
+    /// 全绿。所以这里断言的是**字节相等**，不是「含有某些字段」。
+    #[test]
+    fn project_frame_passes_authenticated_frames_through_verbatim() {
+        assert_eq!(
+            project_frame(SWITCH_FRAME, SessionAudience::Authenticated),
+            Some(SWITCH_FRAME.to_string()),
+            "已鉴权连接的 switch 帧必须逐字透传"
+        );
+    }
+
+    /// 匿名（本机无会话）连接：switch 帧必须被剥成只剩 type 与降级标记。
+    ///
+    /// 本机任何无凭据调用方拿到的是**降级流**而不是
+    /// 401，所以它确实能看到「发生了切换」，但看不到**切到哪一个、叫什么** ——
+    /// 后两者正是判定格第 7 格（Loopback / 无 Origin / 无代理信号 + `Cred::None`）
+    /// 放行时绝不该外泄的东西。
+    #[test]
+    fn project_frame_strips_provider_details_for_anonymous() {
+        let projected = project_frame(SWITCH_FRAME, SessionAudience::AnonymousLoopback)
+            .expect("switch 帧必须仍被下发 —— 匿名降级不是静默丢帧");
+        let parsed: serde_json::Value = serde_json::from_str(&projected)
+            .unwrap_or_else(|e| panic!("降级帧必须是合法 JSON（{projected:?}）：{e}"));
+
+        assert_eq!(parsed["type"], "switch", "type 必须保留，前端据此刷新");
+        assert_eq!(
+            parsed["degraded"], true,
+            "降级标记必须显式带上，否则前端无法区分「切了但看不到细节」与「没切」"
+        );
+        assert!(
+            parsed.get("provider_id").is_none(),
+            "匿名流里不得出现 provider_id（实际 {parsed}）"
+        );
+        assert!(
+            parsed.get("name").is_none(),
+            "匿名流里不得出现 provider 名（实际 {parsed}）"
+        );
+        assert!(
+            !projected.contains("Secret Provider"),
+            "provider 名字连文本都不得残留：{projected}"
+        );
+    }
+
+    /// 匿名连接上**非** switch 的帧类型原样下发：降级只针对 provider 细节。
+    ///
+    /// 例如 `{"type":"shutdown"}` —— 漏掉它等于让匿名客户端在服务停止时永远
+    /// 挂着一条死连接。
+    #[test]
+    fn project_frame_keeps_other_frame_types_for_anonymous() {
+        let raw = r#"{"type":"shutdown"}"#;
+        assert_eq!(
+            project_frame(raw, SessionAudience::AnonymousLoopback),
+            Some(raw.to_string()),
+            "非 switch 帧不得被降级逻辑波及"
+        );
+    }
+
+    /// 非法 JSON：跳过这一帧（`None`），但绝不因此断流。
+    ///
+    /// 广播端不止 handler 一处（tray / failover_switch / provider 切换命令），
+    /// 任何一处写出非 JSON 的载荷都不该把匿名客户端的连接掐掉。
+    #[test]
+    fn project_frame_skips_invalid_json_instead_of_breaking_the_stream() {
+        assert_eq!(
+            project_frame("not json at all", SessionAudience::AnonymousLoopback),
+            None,
+            "匿名档遇到非法 JSON 必须返回 None（跳过该帧）"
+        );
+        assert_eq!(
+            project_frame("not json at all", SessionAudience::Authenticated),
+            Some("not json at all".to_string()),
+            "已鉴权连接逐字透传，不做解析"
+        );
+    }
+
+    /// 编译期签名锁：只有当 `handler` 的第二个参数**恰好**是必填的
+    /// `Json<ProxyControlRequest>` 时，这个 where 约束才成立。
+    ///
+    /// 为什么要单独锁签名：`Option<T>` 在 axum 里实现了 `FromRequest`，
+    /// 它把所有 extractor rejection（含 415）吞成 `None`
+    /// （axum-core `extract/mod.rs`）。所以 `Option<Json<..>>` 和 `Json<..>`
+    /// 对上面那些直接测 extractor 的用例是等价的，但前者会让 CORS 简单请求
+    /// （跨站 `<form method="POST">`、不带 Content-Type 的 `fetch`）拿到
+    /// `None` → 落到 `unwrap_or(false)` → 触发 `stop_with_restore()`，
+    /// 即 CSRF 洞重新打开，而测试照样全绿。函数项的 `Fn` 实现对参数类型是精确的，
+    /// 没有隐式转换，所以这里能在编译期把签名钉死。
+    ///
+    /// 之所以能做到这一点而不构造 `RemoteState`：`RemoteState` 持有
+    /// `tauri::AppHandle`（默认 `Wry`），而 `tauri::test::mock_app()` 给的是
+    /// `AppHandle<MockRuntime>`，两者不是同一个类型，构造 router 级测试会先卡在
+    /// 这里。而本断言只用到类型名，不构造任何值。
+    fn assert_takes_required_json_body<F, Fut>(_handler: F)
+    where
+        F: Fn(AxumState<Arc<RemoteState>>, Json<ProxyControlRequest>) -> Fut,
+    {
+    }
+
+    /// CSRF 回归（签名级）：`proxy_control` 的 body 参数必须是必填的
+    /// `Json<ProxyControlRequest>`，不能退回 `Option<Json<..>>`。
+    ///
+    /// 改回 `Option<Json<..>>`（CSRF 修复被静默撤销）时本测试无法编译 ——
+    /// `cargo test` 会在这里直接失败，而不是让上面 6 个用例误报通过。
+    #[test]
+    fn proxy_control_takes_required_json_body() {
+        assert_takes_required_json_body(proxy_control);
+    }
+
+    /// 构造一个 POST /api/proxy/control 请求（Content-Type / body 均可指定，
+    /// 用于复现跨站表单提交与不带 Content-Type 的 fetch 这两种 CORS 简单请求）。
+    fn req(content_type: Option<&'static str>, body: &'static str) -> Request<Body> {
+        let mut builder = Request::builder().method("POST").uri("/api/proxy/control");
+        if let Some(ct) = content_type {
+            builder = builder.header(CONTENT_TYPE, ct);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    /// 模拟 handler 的 `Json<ProxyControlRequest>` extractor（不构造 RemoteState）。
+    async fn extract_body(req: Request<Body>) -> Result<ProxyControlRequest, Response> {
+        Json::<ProxyControlRequest>::from_request(req, &())
+            .await
+            .map(|Json(b)| b)
+            .map_err(|e| e.into_response())
+    }
+
+    /// 断言该请求被 extractor 拒绝，并返回拒绝时的 HTTP 状态码。
+    async fn rejection_status(
+        content_type: Option<&'static str>,
+        body: &'static str,
+    ) -> StatusCode {
+        match extract_body(req(content_type, body)).await {
+            Ok(_) => panic!("request must be rejected, but body was accepted"),
+            Err(resp) => resp.status(),
+        }
+    }
+
+    /// CSRF 回归：跨站表单提交是 CORS 简单请求，不会带 JSON Content-Type，
+    /// 必须被 415 挡下，否则会触发 stop_with_restore()（停代理 + 清 enabled + 删备份）。
+    #[tokio::test]
+    async fn form_post_is_rejected_with_415() {
+        let status = rejection_status(Some("application/x-www-form-urlencoded"), "").await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// CSRF 回归：不带 Content-Type 的 `fetch(url, {method:'POST'})` 同样是简单请求。
+    #[tokio::test]
+    async fn missing_content_type_is_rejected_with_415() {
+        let status = rejection_status(None, "").await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// text/plain 也必须被拒。
+    #[tokio::test]
+    async fn text_plain_is_rejected_with_415() {
+        let status = rejection_status(Some("text/plain"), "{}").await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// 合法调用方行为不变：`{}` 仍然解析为 start = false（停止代理）。
+    #[tokio::test]
+    async fn empty_json_object_still_parses_as_stop() {
+        let parsed = extract_body(req(Some("application/json"), "{}"))
+            .await
+            .expect("`{}` must still parse");
+        assert!(!parsed.start, "`{{}}` must keep meaning 'stop proxy'");
+    }
+
+    /// 合法调用方行为不变：`{"start": true}` 仍然解析为启动代理。
+    #[tokio::test]
+    async fn start_true_still_parses() {
+        let parsed = extract_body(req(Some("application/json"), r#"{"start":true}"#))
+            .await
+            .expect("start:true must parse");
+        assert!(parsed.start);
+    }
+
+    /// 合法调用方行为不变：`{"start": false}` 仍然解析为停止代理。
+    #[tokio::test]
+    async fn start_false_still_parses_as_stop() {
+        let parsed = extract_body(req(Some("application/json"), r#"{"start":false}"#))
+            .await
+            .expect("start:false must parse");
+        assert!(!parsed.start);
+    }
+
+    /// 本文件自身的源码，用来在测试期做静态扫描（见下面两个脱敏回归用例）。
+    const HANDLERS_SRC: &str = include_str!("handlers.rs");
+
+    /// 从 `sig` 起按大括号配平截出一个函数体，返回其源码文本。
+    ///
+    /// 故意不做词法分析：这两个 handler 里出现的花括号都来自 `{}` 格式化占位符
+    /// 或真正的代码块，本身配平，所以朴素计数就够。真正的风险是「截歪了却
+    /// 悄悄通过」，由两个用例各自的尾部哨兵（sentinel）断言挡住。
+    fn fn_body(src: &str, sig: &str) -> String {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("signature not found in handlers.rs: {sig}"));
+        let rest = &src[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("no body brace after: {sig}"));
+        let mut depth = 0usize;
+        // `char_indices()` 的偏移是相对 `body` 这段切片自身的，所以拼回
+        // `rest` 时必须加上 `open` —— 少加会把函数体截掉前 `open` 个字节，
+        // 症状是「少了函数尾部那一小截」，很容易被当成正常。
+        let body = &rest[open..];
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return body[..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in body of: {sig}");
+    }
+
+    /// 判断一行是不是「把某个值写进错误载荷」的字段初始化。
+    ///
+    /// 必须在**整行**里找，不能只认行首：真正漏检过的那一行长得是
+    /// `return Json(json!({"success": false, "error": e.to_string()}))...`，
+    /// `"error":` 夹在行中间。只匹配行首的写法会把这个洞原样放过。
+    ///
+    /// 匹配 `"error":` / `"message":`（`json!` 的字符串键）与 `error:` /
+    /// `message:`（DTO 字段名）。`"error_category":` 不会被误伤 —— 它不等于
+    /// `"error":`，是分类字段而非上游原文。
+    fn is_error_payload_line(line: &str) -> bool {
+        line.contains("\"error\":")
+            || line.contains("\"message\":")
+            || line.contains("error:")
+            || line.contains("message:")
+    }
+
+    /// 不需要脱敏的合法行：`None`（没有错误可报）。
+    fn is_allowed_without_redaction(line: &str) -> bool {
+        let t = line.trim();
+        t == "error: None," || t == "error: None" || t == "message: None,"
+    }
+
+    /// 脱敏回归（源码级）：`/api/usage` 的 `get_usage` 里，每一个把值写进
+    /// 错误载荷的字段，都必须经过 `redact_error`。
+    ///
+    /// 这条锁的是真正出过的那个洞：错误分支在同一个函数里各自拼
+    /// `json!`，漏掉一处就把内部错误原文（可能夹带 base_url / 凭据片段）
+    /// 逐字交给了远程调用方，而同文件其他分支全都在脱敏，测试照样全绿。
+    #[test]
+    fn get_usage_error_fields_go_through_redaction() {
+        let body = fn_body(HANDLERS_SRC, "pub async fn get_usage");
+        // 尾部哨兵：确认没有把别的函数截进来。
+        assert!(
+            body.contains("\"providers\": results"),
+            "get_usage body extraction looks truncated: {body}"
+        );
+
+        for line in body.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") || !is_error_payload_line(line) {
+                continue;
+            }
+            if is_allowed_without_redaction(line) {
+                continue;
+            }
+            assert!(
+                line.contains("redact_error"),
+                "get_usage writes an error payload without going through redact_error \
+                 — the upstream text would reach the caller verbatim:\n  {}\n(body: {})",
+                line.trim(),
+                body,
+            );
+        }
+    }
+
+    /// 脱敏回归（源码级）：`/api/provider/test` 的 `test_provider` 同上。
+    ///
+    /// 历史上这条路径上的 `resolve_copilot_base_url_override` 失败分支就是把
+    /// `e.to_string()` 裸塞进 `json!` 的那一处。
+    #[test]
+    fn test_provider_error_fields_go_through_redaction() {
+        let body = fn_body(HANDLERS_SRC, "pub async fn test_provider");
+        // 尾部哨兵：确认没有把后面的 handler 截进来。
+        assert!(
+            body.contains("\"error_category\""),
+            "test_provider body extraction looks truncated: {body}"
+        );
+
+        for line in body.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") || !is_error_payload_line(line) {
+                continue;
+            }
+            if is_allowed_without_redaction(line) {
+                continue;
+            }
+            assert!(
+                line.contains("redact_error"),
+                "test_provider writes an error payload without going through redact_error \
+                 — the upstream text would reach the caller verbatim:\n  {}\n(body: {})",
+                line.trim(),
+                body,
+            );
+        }
+    }
 }
