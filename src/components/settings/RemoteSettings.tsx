@@ -5,7 +5,7 @@ import { ToggleRow } from "@/components/ui/toggle-row";
 import { Input } from "@/components/ui/input";
 import { Wifi, Globe, Server, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { invoke } from "@tauri-apps/api/core";
+import { remoteApi } from "@/lib/api/remote";
 
 interface RemoteSettingsProps {
   settings: SettingsFormState;
@@ -77,7 +77,8 @@ export function RemoteSettings({ settings, onChange }: RemoteSettingsProps) {
 
   useEffect(() => {
     if (settings.remoteTailscaleEnabled && settings.remoteEnabled) {
-      invoke<string | null>("get_tailscale_ip")
+      remoteApi
+        .getTailscaleIp()
         .then((ip) => {
           setTailscaleIp(ip);
         })
@@ -95,10 +96,10 @@ export function RemoteSettings({ settings, onChange }: RemoteSettingsProps) {
     try {
       if (value) {
         const startPort = settings.remotePort || 4000;
-        await invoke("start_remote_server", {
-          port: startPort,
-          tailscaleEnabled: settings.remoteTailscaleEnabled,
-        });
+        await remoteApi.startRemoteServer(
+          startPort,
+          !!settings.remoteTailscaleEnabled,
+        );
         // 等待服务器真正启动
         await new Promise((resolve) => setTimeout(resolve, 1000));
         const isRunning = await checkServerStatus(startPort);
@@ -107,7 +108,7 @@ export function RemoteSettings({ settings, onChange }: RemoteSettingsProps) {
         }
         setServerRunning(true);
       } else {
-        await invoke("stop_remote_server");
+        await remoteApi.stopRemoteServer();
         setServerRunning(false);
       }
       // 只有 RPC 成功后才持久化
@@ -127,7 +128,7 @@ export function RemoteSettings({ settings, onChange }: RemoteSettingsProps) {
   ) => {
     setRestarting(true);
     try {
-      await invoke("restart_remote_server", { port, tailscaleEnabled });
+      await remoteApi.restartRemoteServer(port, tailscaleEnabled);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       const isRunning = await checkServerStatus(port);
       if (!isRunning) {
@@ -144,7 +145,7 @@ export function RemoteSettings({ settings, onChange }: RemoteSettingsProps) {
   const handleTailscaleToggle = async (value: boolean) => {
     if (value) {
       try {
-        const available = await invoke<boolean>("check_tailscale_available");
+        const available = await remoteApi.checkTailscaleAvailable();
         if (!available) {
           toast.error(t("settings.remoteTailscaleNotAvailable"));
           return;

@@ -92,6 +92,7 @@ import UnifiedSkillsPanel, {
 } from "@/components/skills/UnifiedSkillsPanel";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+import ApprovalPrompt from "@/components/settings/ApprovalPrompt";
 import { AgentsPanel } from "@/components/agents/AgentsPanel";
 import { UniversalProviderPanel } from "@/components/universal";
 import { McpIcon } from "@/components/BrandIcons";
@@ -1825,6 +1826,8 @@ function App() {
 
       <DeepLinkImportDialog />
       <FirstRunNoticeDialog />
+      {/* 配对审批：挂在 App 这一层，与当前停在哪个页面无关。 */}
+      <ApprovalPrompt />
     </div>
   );
 }

@@ -3276,5 +3276,55 @@
     "expiredHint": "Run the {{tool}} command to refresh your login",
     "queryFailed": "Query failed",
     "refresh": "Refresh"
+  },
+  "remote": {
+    "approval": {
+      "title": "Device Approval Required",
+      "evidence": {
+        "tailnet": "Tailnet",
+        "loopback": "Loopback",
+        "unavailable": "Unavailable",
+        "nodeName": "Node",
+        "nodeStableId": "Stable ID",
+        "loginName": "Account",
+        "peerAddr": "Peer address",
+        "loopbackDescription": "A process running on this machine.",
+        "notInTailnet": "Not in your tailnet",
+        "notInTailnetDescription": "The requesting address is not part of this tailnet.",
+        "unavailableDescription": "The source of this request could not be verified.",
+        "degradedAck": "I understand this request could not be verified."
+      },
+      "userCode": {
+        "label": "Verification Code",
+        "empty": "No code yet — open the link on this device to continue."
+      },
+      "foreignAccount": {
+        "warning": "This device is signed in to a different account. Switch accounts before approving.",
+        "ack": "I have verified the account on the other device."
+      },
+      "approve": "Approve",
+      "reject": "Reject",
+      "close": "Close",
+      "failed": "The approval request could not be completed.",
+      "client": {
+        "label": "Requesting device"
+      },
+      "defaultAction": {
+        "approve": "Suggested action: approve",
+        "reject": "Suggested action: reject"
+      }
+    },
+    "settings": {
+      "bindScope": {
+        "label": "Binding Scope",
+        "confirm": "Confirm Binding Scope"
+      },
+      "cors": {
+        "mode": "CORS Mode"
+      },
+      "origin": {
+        "whitelist": "Origin Whitelist"
+      }
+    }
   }
 }
