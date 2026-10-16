@@ -339,6 +339,8 @@ If you launch from a desktop icon, add it to the `.desktop` `Exec=` line (e.g. `
 
 For detailed guides on every feature, check out the **[User Manual](docs/user-manual/en/README.md)** — covering provider management, MCP/Prompts/Skills, proxy & failover, and more.
 
+- **[Remote Access Client Credential Contract (EN)](docs/guides/remote-client-auth-en.md)** — what a third-party client must do with its credential: bearer header vs. session cookie, where the plaintext token goes, and what no client may ever do. The client half is delivered as a contract, not code — see [中文版](docs/guides/remote-client-auth-zh.md).
+
 ## Quick Start
 
 ### Basic Usage
@@ -634,7 +636,7 @@ curl -sS -X POST http://127.0.0.1:4000/api/... \
 | `GET` | `/api/events` | — | **SSE event stream** (see below) |
 | `GET` | `/api/icon` | — | App icon PNG |
 | `GET` | `/api/provider-icons/:name` | — | Provider-specific icon PNG |
-| `POST` | `/api/switch` | `{ "providerId": "..." }` | Switch to a provider by id |
+| `POST` | `/api/switch` | `{ "provider_id": "..." }` | Switch to a provider by id |
 | `POST` | `/api/reorder` | `{ "movedId": "...", "beforeId": "..." }` | Drag-and-drop reorder (empty `beforeId` = move to end) |
 | `POST` | `/api/provider/test` | `{ "providerId": "...", "appType": "claude" }` | Connectivity test (same as UI "Test" button) |
 | `POST` | `/api/proxy/control` | `{}` (stop) or `{ "start": true }` (start + takeover) | Unified proxy start/stop |
@@ -655,10 +657,14 @@ curl -S http://127.0.0.1:4000/api/providers
 # Switch provider
 curl -S -X POST http://127.0.0.1:4000/api/switch \
   -H 'Content-Type: application/json' \
-  -d '{"providerId":"15bcbddc-4250-4ecf-af3c-bdb21058bda6"}'
+  -d '{"provider_id":"15bcbddc-4250-4ecf-af3c-bdb21058bda6"}'
 
 # Stop proxy (restores live settings.json, clears enabled flags)
-curl -S -X POST http://127.0.0.1:4000/api/proxy/control
+# The JSON body is required — a request without `Content-Type: application/json` is
+# rejected with 415, so cross-site form posts cannot trigger this endpoint.
+curl -S -X POST http://127.0.0.1:4000/api/proxy/control \
+  -H 'Content-Type: application/json' \
+  -d '{}'
 
 # Start proxy + take over all apps' live settings.json
 curl -S -X POST http://127.0.0.1:4000/api/proxy/control \

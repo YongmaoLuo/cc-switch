@@ -1,3 +1,4 @@
+node_modules
 node_modules/
 dist/
 release/
@@ -29,3 +30,7 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+
+# Local workflow artifacts (not part of the product)
+Local-PDT/
+plans/
