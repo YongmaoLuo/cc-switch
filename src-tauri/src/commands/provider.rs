@@ -5,7 +5,8 @@ use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::error::AppError;
-use crate::provider::{ClaudeDesktopMode, Provider};
+use crate::provider::{ClaudeDesktopMode, Provider, ProviderMeta};
+use crate::services::provider::{EditorSave, EditorView};
 use crate::services::{
     EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
 };
@@ -41,6 +42,7 @@ pub async fn add_provider(
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
+    #[allow(non_snake_case)] editorSave: Option<EditorSave>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let add_to_live = addToLive.unwrap_or(true);
@@ -48,7 +50,7 @@ pub async fn add_provider(
         let state = app_handle
             .try_state::<AppState>()
             .ok_or_else(|| "应用状态不可用".to_string())?;
-        ProviderService::add(state.inner(), app_type, provider, add_to_live)
+        ProviderService::add_from_editor(state.inner(), app_type, provider, add_to_live, editorSave)
             .map_err(|e| e.to_string())
     })
     .await
@@ -61,17 +63,62 @@ pub async fn update_provider(
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
+    #[allow(non_snake_case)] editorSave: Option<EditorSave>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()
             .ok_or_else(|| "应用状态不可用".to_string())?;
-        ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
-            .map_err(|e| e.to_string())
+        ProviderService::update_from_editor(
+            state.inner(),
+            app_type,
+            originalId.as_deref(),
+            provider,
+            editorSave,
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("供应商更新任务执行失败: {e}"))?
+}
+
+/// 供应商编辑器底部 JSON 的显示内容：切到这个供应商之后配置文件会是什么样。
+/// `settingsConfig` 是供应商的行（新增时传空对象）。
+/// Codex draft metadata wins over the stored provider's metadata when supplied.
+#[tauri::command]
+pub async fn get_provider_editor_view(
+    app_handle: tauri::AppHandle,
+    app: String,
+    #[allow(non_snake_case)] settingsConfig: serde_json::Value,
+    category: Option<String>,
+    #[allow(non_snake_case)] providerId: Option<String>,
+    meta: Option<ProviderMeta>,
+) -> Result<EditorView, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        let category = ProviderService::editor_category(
+            state.inner(),
+            &app_type,
+            providerId.as_deref(),
+            category,
+        )
+        .map_err(|e| e.to_string())?;
+        ProviderService::editor_view_with_meta(
+            state.inner(),
+            app_type,
+            &settingsConfig,
+            category.as_deref(),
+            providerId.as_deref(),
+            meta.as_ref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("读取编辑器内容失败: {e}"))?
 }
 
 #[tauri::command]
@@ -122,16 +169,13 @@ pub async fn switch_provider(
     id: String,
 ) -> Result<SwitchResult, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    let result = tauri::async_runtime::spawn_blocking({
-        let app_handle = app_handle.clone();
-        let id_for_blocking = id.clone();
-        move || {
-            let state = app_handle
-                .try_state::<AppState>()
-                .ok_or_else(|| "应用状态不可用".to_string())?;
-            switch_provider_internal(state.inner(), app_type, &id_for_blocking)
-                .map_err(|e| e.to_string())
-        }
+    let handle = app_handle.clone();
+    let id_for_broadcast = id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        switch_provider_internal(state.inner(), app_type, &id).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("供应商切换任务执行失败: {e}"))??;
@@ -139,11 +183,10 @@ pub async fn switch_provider(
     // 广播给远程浏览器（SSE）
     let app_handle = app_handle.clone();
     let app_type_str = app.as_str().to_string();
-    let id_clone = id.clone();
     tauri::async_runtime::spawn(async move {
-        crate::remote::broadcast_provider_switch(&app_handle, &app_type_str, &id_clone).await;
+        crate::remote::broadcast_provider_switch(&app_handle, &app_type_str, &id_for_broadcast)
+            .await;
     });
-
     Ok(result)
 }
 
@@ -520,6 +563,47 @@ fn resolve_native_credentials(app_type: &AppType, provider: Option<&Provider>) -
         .unwrap_or_default()
 }
 
+/// Coding Plan（`template_type == "token_plan"`）用哪套凭据。
+///
+/// ZenMux 的用量接口与推理接口不同源：脚本里可以单独存一组
+/// `base_url` / `api_key`；脚本没给全时回落到供应商自身的原生凭据。其他
+/// Coding Plan 供应商没有这个分歧，直接走 `resolve_native_credentials`。
+fn resolve_coding_plan_credentials(
+    app_type: &AppType,
+    provider: Option<&Provider>,
+    usage_script: Option<&crate::provider::UsageScript>,
+) -> (String, String) {
+    let is_zenmux = usage_script
+        .and_then(|s| s.coding_plan_provider.as_deref())
+        .map(|provider| provider.eq_ignore_ascii_case("zenmux"))
+        .unwrap_or(false);
+
+    if !is_zenmux {
+        return resolve_native_credentials(app_type, provider);
+    }
+
+    let script_base_url = usage_script
+        .and_then(|s| s.base_url.as_deref())
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    let script_api_key = usage_script
+        .and_then(|s| s.api_key.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    if !script_base_url.is_empty() && !script_api_key.is_empty() {
+        return (script_base_url, script_api_key);
+    }
+
+    let native = resolve_native_credentials(app_type, provider);
+    if !native.0.is_empty() && !native.1.is_empty() {
+        native
+    } else {
+        (script_base_url, script_api_key)
+    }
+}
+
 pub async fn query_provider_usage_inner(
     state: &AppState,
     copilot_state: &CopilotAuthState,
@@ -578,8 +662,9 @@ pub async fn query_provider_usage_inner(
 
     // ── Coding Plan 专用路径 ──
     if template_type == TEMPLATE_TYPE_TOKEN_PLAN {
-        // 从供应商配置中提取 API Key 和 Base URL（按 app 区分存储格式）
-        let (base_url, api_key) = resolve_native_credentials(&app_type, provider);
+        // 从供应商配置 / usage_script 中提取 API Key 和 Base URL（ZenMux 两者不同源）
+        let (base_url, api_key) =
+            resolve_coding_plan_credentials(&app_type, provider, usage_script);
 
         // 火山方舟用账号 AK/SK 签名查询用量（存于 usage_script，与推理 api_key 分离）；
         // 其他供应商为 None，service 层沿用 api_key。
@@ -612,6 +697,19 @@ pub async fn query_provider_usage_inner(
             });
         }
 
+        // ZenMux 的 tier 携带 USD 额度信息，需要编码为 JSON extra
+        let has_usd = quota
+            .tiers
+            .first()
+            .map(|t| t.used_value_usd.is_some())
+            .unwrap_or(false);
+        let plan_label = quota
+            .credential_message
+            .as_deref()
+            .and_then(|msg| msg.split(' ').next())
+            .map(|tier| format!("ZenMux·{}", tier.to_uppercase()));
+        let mut first_tier = true;
+
         let data: Vec<crate::provider::UsageData> = quota
             .tiers
             .iter()
@@ -619,6 +717,26 @@ pub async fn query_provider_usage_inner(
                 let total = 100.0;
                 let used = tier.utilization;
                 let remaining = total - used;
+                let extra = if has_usd {
+                    let mut extra_json = serde_json::json!({
+                        "resetsAt": tier.resets_at,
+                    });
+                    if let Some(v) = tier.used_value_usd {
+                        extra_json["usedValueUsd"] = serde_json::json!(v);
+                    }
+                    if let Some(v) = tier.max_value_usd {
+                        extra_json["maxValueUsd"] = serde_json::json!(v);
+                    }
+                    if first_tier {
+                        if let Some(ref label) = plan_label {
+                            extra_json["planLabel"] = serde_json::json!(label);
+                        }
+                        first_tier = false;
+                    }
+                    Some(extra_json.to_string())
+                } else {
+                    tier.resets_at.clone()
+                };
                 crate::provider::UsageData {
                     plan_name: Some(tier.name.clone()),
                     remaining: Some(remaining),
@@ -627,7 +745,7 @@ pub async fn query_provider_usage_inner(
                     unit: Some("%".to_string()),
                     is_valid: Some(true),
                     invalid_message: None,
-                    extra: tier.resets_at.clone(),
+                    extra,
                 }
             })
             .collect();
@@ -804,14 +922,19 @@ pub fn update_endpoint_last_used(
         .map_err(|e| e.to_string())
 }
 
+/// 排序就是故障转移队列的优先级，托盘按它列队列：改完重建托盘。
 #[tauri::command]
 pub fn update_providers_sort_order(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     app: String,
     updates: Vec<ProviderSortUpdate>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update_sort_order(state.inner(), app_type, updates).map_err(|e| e.to_string())
+    let changed = ProviderService::update_sort_order(state.inner(), app_type, updates)
+        .map_err(|e| e.to_string())?;
+    crate::tray::refresh_tray_menu(&app_handle);
+    Ok(changed)
 }
 
 use crate::provider::UniversalProvider;
@@ -1109,10 +1232,34 @@ mod import_claude_desktop_tests {
 
 #[cfg(test)]
 mod native_query_credentials_tests {
-    use super::resolve_native_credentials;
+    use super::{resolve_coding_plan_credentials, resolve_native_credentials};
     use crate::app_config::AppType;
-    use crate::provider::Provider;
+    use crate::provider::{Provider, UsageScript};
     use serde_json::json;
+
+    fn usage_script(
+        coding_plan_provider: Option<&str>,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> UsageScript {
+        UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: String::new(),
+            timeout: Some(10),
+            api_key: api_key.map(str::to_string),
+            base_url: base_url.map(str::to_string),
+            access_token: None,
+            user_id: None,
+            template_type: Some("token_plan".to_string()),
+            auto_query_interval: None,
+            coding_plan_provider: coding_plan_provider.map(str::to_string),
+            access_key_id: None,
+            secret_access_key: None,
+            team_organization_id: None,
+            team_project_id: None,
+        }
+    }
 
     #[test]
     fn delegates_to_provider_for_codex() {
@@ -1137,5 +1284,53 @@ mod native_query_credentials_tests {
         let (base_url, api_key) = resolve_native_credentials(&AppType::Codex, None);
         assert!(base_url.is_empty());
         assert!(api_key.is_empty());
+    }
+
+    #[test]
+    fn zenmux_coding_plan_uses_script_credentials_first() {
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.zenmux.example/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-provider"
+                }
+            }),
+            None,
+        );
+        let script = usage_script(
+            Some("zenmux"),
+            Some("https://script.zenmux.example/api/usage/"),
+            Some("sk-script"),
+        );
+
+        let (base_url, api_key) =
+            resolve_coding_plan_credentials(&AppType::Claude, Some(&provider), Some(&script));
+
+        assert_eq!(base_url, "https://script.zenmux.example/api/usage");
+        assert_eq!(api_key, "sk-script");
+    }
+
+    #[test]
+    fn zenmux_coding_plan_falls_back_to_provider_credentials() {
+        let provider = Provider::with_id(
+            "test".to_string(),
+            "Test".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://provider.zenmux.example/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-provider"
+                }
+            }),
+            None,
+        );
+        let script = usage_script(Some("zenmux"), Some("https://script.zenmux.example"), None);
+
+        let (base_url, api_key) =
+            resolve_coding_plan_credentials(&AppType::Claude, Some(&provider), Some(&script));
+
+        assert_eq!(base_url, "https://provider.zenmux.example/v1");
+        assert_eq!(api_key, "sk-provider");
     }
 }

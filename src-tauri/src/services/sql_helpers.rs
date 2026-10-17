@@ -66,24 +66,10 @@ pub fn fresh_input_sql(alias: &str) -> String {
     )
 }
 
-/// Build an SQL expression for the **cache-normalized real total tokens** of a
-/// single row in `proxy_request_logs` or `usage_daily_rollups`:
+/// 单行的「真实消耗 Tokens」：新增输入 + 输出 + 缓存写入 + 缓存命中。
 ///
-/// ```text
-/// fresh_input + output + cache_creation + cache_read
-/// ```
-///
-/// 单一口径（SSOT）：这是用量看板「真实消耗 Tokens」的定义，与
-/// `derive_real_total_and_hit_rate()` 的 `real_total` 逐项对应。Hero 摘要走
-/// Rust 侧的四列相加，供应商 / 模型统计走本函数在 SQL 侧相加——两条路径必须
-/// 引用同一定义，否则同一时间范围下 Hero 与明细表会给出差几个数量级的数字
-/// （缓存命中率高时 cache_read 远大于 fresh_input + output）。
-///
-/// `fresh_input` 由 [`fresh_input_sql`] 归一，因此对 cache-inclusive 供应商
-/// （codex / gemini / grokbuild）不会把缓存部分重复计入。
-///
-/// Pass an empty string to reference the columns directly (no alias),
-/// or a table alias such as `"l"` to emit `l.output_tokens` style references.
+/// 与 `usage_stats::derive_real_total_and_hit_rate`（指标卡 / 趋势图）同口径，
+/// 供应商、模型等分组统计的 `total_tokens` 都用它，保证各行之和等于顶部总数。
 pub fn real_total_tokens_sql(alias: &str) -> String {
     let prefix = if alias.is_empty() {
         String::new()
@@ -92,10 +78,8 @@ pub fn real_total_tokens_sql(alias: &str) -> String {
     };
     let fresh_input = fresh_input_sql(alias);
     format!(
-        "({fresh_input}) \
-         + {prefix}output_tokens \
-         + {prefix}cache_creation_tokens \
-         + {prefix}cache_read_tokens"
+        "(({fresh_input}) + {prefix}output_tokens \
+          + {prefix}cache_creation_tokens + {prefix}cache_read_tokens)"
     )
 }
 
