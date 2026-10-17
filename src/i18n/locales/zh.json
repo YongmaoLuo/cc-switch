@@ -848,10 +848,6 @@
     "remoteRestartFailed": "远程管理服务重启失败。",
     "remoteStatusRunning": "运行中",
     "remoteStatusStopped": "已停止",
-    "remoteTailscaleEnabled": "允许 Tailscale 远程访问",
-    "remoteTailscaleEnabledDescription": "同时监听 Tailscale IP，可通过手机等远程设备访问管理页面。",
-    "remoteTailscaleNotAvailable": "Tailscale 未安装或未运行，请先安装 Tailscale。",
-    "remoteTailscaleAddress": "Tailscale 访问地址：",
     "codexAuth": "Codex 应用增强",
     "preserveCodexOfficialAuthOnSwitch": "非接管切换时保留官方登录",
     "preserveCodexOfficialAuthOnSwitchDescription": "控制未开启路由接管时切换第三方供应商是否保留 Codex 官方登录；路由接管期间始终保留",
@@ -4157,7 +4153,24 @@
     "settings": {
       "bindScope": {
         "label": "绑定范围",
-        "confirm": "确认绑定范围"
+        "confirm": "确认绑定范围",
+        "description": "远程管理服务监听在哪些网络接口上。",
+        "loopback": "仅本机",
+        "loopbackDescription": "只监听 127.0.0.1，其他设备无法连接。",
+        "tailscale": "仅 Tailscale",
+        "tailscaleDescription": "同时监听 127.0.0.1 与 Tailscale IP，Tailnet 内的设备可以连接。",
+        "allInterfaces": "全部网卡",
+        "allInterfacesDescription": "监听 0.0.0.0，任何能访问本机局域网或 Tailscale 地址的设备都可以连接。",
+        "widenTitle": "确认放宽绑定范围？",
+        "widenTransition": "当前：{{current}} → 目标：{{target}}",
+        "newAddresses": "新增可达地址：",
+        "allInterfacesAddress": "全部网卡（0.0.0.0），端口 {{port}}",
+        "credentialNote": "非回环来源的请求仍然必须持有配对凭证。",
+        "cancel": "取消",
+        "applied": "绑定范围已更新。",
+        "notApplied": "绑定范围未改变。",
+        "failed": "修改绑定范围失败。",
+        "tailscaleUnavailable": "Tailscale 未安装或未运行，请先安装 Tailscale。"
       },
       "cors": {
         "mode": "CORS 模式"

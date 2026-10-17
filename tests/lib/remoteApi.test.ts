@@ -174,9 +174,9 @@ describe("remoteApi", () => {
       config: expect.objectContaining({ bindScope: "loopback" }),
     });
 
-    await remoteApi.requestBindScopeChange("lan");
+    await remoteApi.requestBindScopeChange("tailscale");
     expect(invokeMock).toHaveBeenCalledWith("request_bind_scope_change", {
-      scope: "lan",
+      scope: "tailscale",
     });
   });
 
@@ -213,7 +213,7 @@ describe("remoteApi", () => {
       ],
       [
         "request_bind_scope_change",
-        () => remoteApi.requestBindScopeChange("lan"),
+        () => remoteApi.requestBindScopeChange("tailscale"),
       ],
     ];
 

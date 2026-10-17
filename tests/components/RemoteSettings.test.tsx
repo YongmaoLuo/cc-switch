@@ -45,6 +45,42 @@ function createWrapper() {
   );
 }
 
+interface RemoteConfigFixture {
+  bindScope: "loopback" | "tailscale" | "allInterfaces";
+}
+
+/** Default invoke responder: the component reads the scope from the backend. */
+function mockBackend(scope: RemoteConfigFixture["bindScope"] = "loopback") {
+  invokeMock.mockImplementation((command: string) => {
+    switch (command) {
+      case "get_remote_config":
+        return Promise.resolve({
+          enabled: true,
+          port: 4000,
+          tailscaleEnabled: scope !== "loopback",
+          bindScope: scope,
+          corsMode: "sameOrigin",
+          originWhitelist: [],
+        });
+      case "get_tailscale_ip":
+        return Promise.resolve("100.64.0.9");
+      case "check_tailscale_available":
+        return Promise.resolve(true);
+      case "request_bind_scope_change":
+        return Promise.resolve({ applied: true, bindScope: scope });
+      default:
+        return Promise.resolve("ok");
+    }
+  });
+}
+
+function scopeRadio(
+  name: RegExp,
+  options?: Parameters<typeof screen.getByRole>[1],
+) {
+  return screen.getByRole("radio", { name, ...(options ?? {}) });
+}
+
 describe("RemoteSettings", () => {
   const mockOnChange = vi.fn();
   const defaultSettings: SettingsFormState = {
@@ -58,7 +94,7 @@ describe("RemoteSettings", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    invokeMock.mockResolvedValue("ok");
+    mockBackend("loopback");
     fetchMock.mockResolvedValue({ ok: true });
     server.use(
       http.get(/http:\/\/127\.0\.0\.1:\d+\/api\/health/, () =>
@@ -75,8 +111,14 @@ describe("RemoteSettings", () => {
 
     expect(screen.getByText("settings.remoteManagement")).toBeInTheDocument();
     expect(screen.getByText("settings.remoteEnabled")).toBeInTheDocument();
-    expect(screen.getByText("settings.remoteTailscaleEnabled")).toBeInTheDocument();
     expect(screen.getByText("settings.remotePort")).toBeInTheDocument();
+    // 三选一：旧 Tailscale 开关被档位选择取代。
+    expect(screen.getByText("remote.settings.bindScope.loopback")).toBeInTheDocument();
+    expect(screen.getByText("remote.settings.bindScope.tailscale")).toBeInTheDocument();
+    expect(
+      screen.getByText("remote.settings.bindScope.allInterfaces")
+    ).toBeInTheDocument();
+    expect(screen.queryByText("settings.remoteTailscaleEnabled")).toBeNull();
   });
 
   it("starts remote server when enabled toggle is turned on", async () => {
@@ -121,8 +163,22 @@ describe("RemoteSettings", () => {
     });
   });
 
-  it("checks Tailscale availability before enabling", async () => {
-    invokeMock.mockResolvedValue(false); // Tailscale not available
+  it("checks Tailscale availability before widening to Tailscale", async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_remote_config") {
+        return Promise.resolve({
+          enabled: true,
+          port: 4000,
+          tailscaleEnabled: false,
+          bindScope: "loopback",
+          corsMode: "sameOrigin",
+          originWhitelist: [],
+        });
+      }
+      if (command === "get_tailscale_ip") return Promise.resolve(null);
+      if (command === "check_tailscale_available") return Promise.resolve(false);
+      return Promise.resolve("ok");
+    });
 
     const settingsWithServerEnabled = {
       ...defaultSettings,
@@ -137,22 +193,28 @@ describe("RemoteSettings", () => {
       { wrapper: createWrapper() }
     );
 
-    const toggle = screen.getByRole("switch", {
-      name: /settings\.remotetailscaleenabled/i,
-    });
-    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(
+        scopeRadio(/remote\.settings\.bindscope\.loopback/i)
+      ).toBeChecked(),
+    );
+
+    fireEvent.click(scopeRadio(/remote\.settings\.bindscope\.tailscale/i));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("check_tailscale_available");
       expect(toastErrorMock).toHaveBeenCalledWith(
-        "settings.remoteTailscaleNotAvailable"
+        "remote.settings.bindScope.tailscaleUnavailable"
       );
-      // Should not call onChange since Tailscale is not available
+      // 不可用时不展示确认面板、也不发申请。
+      expect(
+        invokeMock
+      ).not.toHaveBeenCalledWith("request_bind_scope_change", expect.anything());
       expect(mockOnChange).not.toHaveBeenCalled();
     });
   });
 
-  it("disables Tailscale toggle when remote server is disabled", () => {
+  it("disables bind scope options when remote server is disabled", () => {
     const disabledSettings = { ...defaultSettings, remoteEnabled: false };
 
     render(
@@ -160,13 +222,14 @@ describe("RemoteSettings", () => {
       { wrapper: createWrapper() }
     );
 
-    const toggle = screen.getByRole("switch", {
-      name: /settings\.remotetailscaleenabled/i,
-    });
-    expect(toggle).toBeDisabled();
+    expect(scopeRadio(/remote\.settings\.bindscope\.loopback/i)).toBeDisabled();
+    expect(scopeRadio(/remote\.settings\.bindscope\.tailscale/i)).toBeDisabled();
+    expect(
+      scopeRadio(/remote\.settings\.bindscope\.allinterfaces/i)
+    ).toBeDisabled();
   });
 
-  it("enables Tailscale toggle when remote server is enabled", () => {
+  it("enables bind scope options when remote server is enabled", async () => {
     const enabledSettings = { ...defaultSettings, remoteEnabled: true };
 
     render(
@@ -174,10 +237,118 @@ describe("RemoteSettings", () => {
       { wrapper: createWrapper() }
     );
 
-    const toggle = screen.getByRole("switch", {
-      name: /settings\.remotetailscaleenabled/i,
+    const radio = scopeRadio(/remote\.settings\.bindscope\.tailscale/i);
+    expect(radio).not.toBeDisabled();
+  });
+
+  it("shows the confirmation panel for a widening change and applies it", async () => {
+    mockBackend("loopback");
+    const enabledSettings = { ...defaultSettings, remoteEnabled: true };
+
+    render(
+      <RemoteSettings settings={enabledSettings} onChange={mockOnChange} />,
+      { wrapper: createWrapper() }
+    );
+
+    await waitFor(() =>
+      expect(
+        scopeRadio(/remote\.settings\.bindscope\.loopback/i)
+      ).toBeChecked(),
+    );
+
+    // 选择更宽的档位：先出面板，**不**发申请。
+    fireEvent.click(scopeRadio(/remote\.settings\.bindscope\.allinterfaces/i));
+    const dialog = await screen.findByRole("dialog", {
+      name: "remote.settings.bindScope.widenTitle",
     });
-    expect(toggle).not.toBeDisabled();
+    expect(dialog).toBeInTheDocument();
+    expect(
+      invokeMock
+    ).not.toHaveBeenCalledWith("request_bind_scope_change", expect.anything());
+
+    // 面板里确认 → 调用 Tauri 命令（后端再弹原生对话框）。
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_remote_config") {
+        return Promise.resolve({
+          enabled: true,
+          port: 4000,
+          tailscaleEnabled: false,
+          bindScope: "loopback",
+          corsMode: "sameOrigin",
+          originWhitelist: [],
+        });
+      }
+      if (command === "check_tailscale_available") return Promise.resolve(true);
+      if (command === "get_tailscale_ip") return Promise.resolve("100.64.0.9");
+      if (command === "request_bind_scope_change") {
+        return Promise.resolve({ applied: true, bindScope: "allInterfaces" });
+      }
+      return Promise.resolve("ok");
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "remote.settings.bindScope.confirm",
+      })
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("request_bind_scope_change", {
+        scope: "allInterfaces",
+      });
+      expect(mockOnChange).toHaveBeenCalledWith({
+        remoteTailscaleEnabled: true,
+      });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).toBeNull()
+    );
+  });
+
+  it("applies a narrowing change immediately without the confirmation panel", async () => {
+    mockBackend("allInterfaces");
+    const enabledSettings = { ...defaultSettings, remoteEnabled: true };
+
+    render(
+      <RemoteSettings settings={enabledSettings} onChange={mockOnChange} />,
+      { wrapper: createWrapper() }
+    );
+
+    await waitFor(() =>
+      expect(
+        scopeRadio(/remote\.settings\.bindscope\.allinterfaces/i)
+      ).toBeChecked(),
+    );
+
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_remote_config") {
+        return Promise.resolve({
+          enabled: true,
+          port: 4000,
+          tailscaleEnabled: true,
+          bindScope: "allInterfaces",
+          corsMode: "sameOrigin",
+          originWhitelist: [],
+        });
+      }
+      if (command === "get_tailscale_ip") return Promise.resolve("100.64.0.9");
+      if (command === "request_bind_scope_change") {
+        return Promise.resolve({ applied: true, bindScope: "loopback" });
+      }
+      return Promise.resolve("ok");
+    });
+
+    fireEvent.click(scopeRadio(/remote\.settings\.bindscope\.loopback/i));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("request_bind_scope_change", {
+        scope: "loopback",
+      });
+      expect(mockOnChange).toHaveBeenCalledWith({
+        remoteTailscaleEnabled: false,
+      });
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("allows port changes when server is not running", async () => {

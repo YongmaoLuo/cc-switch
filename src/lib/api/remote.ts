@@ -36,8 +36,27 @@ export const REMOTE_COMMANDS = [
 
 export type RemoteCommandName = (typeof REMOTE_COMMANDS)[number];
 
-/** Mirrors the Rust `BindScope` enum (serde `camelCase`). */
-export type BindScope = "loopback" | "lan";
+/**
+ * Mirrors the Rust `BindScope` enum (serde `camelCase`).
+ *
+ * The declaration order is the contract: `loopback < tailscale < allInterfaces`
+ * is exactly the "narrower / wider" order the backend uses to decide whether a
+ * change needs the second confirmation step. Widening needs confirmation;
+ * narrowing applies immediately.
+ */
+export type BindScope = "loopback" | "tailscale" | "allInterfaces";
+
+/** Mirrors the Rust `BindScopeChangeResponse` (serde `camelCase`). */
+export interface BindScopeChangeResponse {
+  /** Whether the requested scope is in effect when this call returns. */
+  applied: boolean;
+  /** The scope in effect after this call (the old one while a confirmation is pending). */
+  bindScope: BindScope;
+  /** Only for a pending widening request: the id the confirm endpoint expects. */
+  confirmationId?: string;
+  /** Only for a pending widening request: Unix seconds. */
+  expiresAt?: number;
+}
 
 /** Mirrors the Rust `CorsMode` enum (serde `camelCase`). No wildcard variant exists. */
 export type CorsMode = "sameOrigin" | "explicitWhitelist";
@@ -155,8 +174,20 @@ export const remoteApi = {
     return invoke("set_remote_config", { config });
   },
 
-  /** 点火：返回 confirmation id，不改配置也不落盘。 */
-  async requestBindScopeChange(scope: BindScope): Promise<string> {
+  /**
+   * 申请修改绑定范围。
+   *
+   * - 往窄的档位拨：后端立即落盘并重绑 listener，返回 `applied: true`。
+   * - 往宽的档位拨：后端登记一条待确认请求，并由 **Rust 侧弹原生对话框**；
+   *   用户点确认之后才生效。渲染层拿不到一个可以自己兑现的 id —— 桌面端
+   *   根本没有 `confirm_bind_scope_change` 命令。
+   *
+   * 浏览器走的是另一组 REST 端点（`/api/remote/config/bind-scope/*`），
+   * 因为它的确认方是另一个已认证会话，不是这个 webview。
+   */
+  async requestBindScopeChange(
+    scope: BindScope,
+  ): Promise<BindScopeChangeResponse> {
     return invoke("request_bind_scope_change", { scope });
   },
 };

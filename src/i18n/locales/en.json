@@ -848,10 +848,6 @@
     "remoteRestartFailed": "Failed to restart remote server.",
     "remoteStatusRunning": "Running",
     "remoteStatusStopped": "Stopped",
-    "remoteTailscaleEnabled": "Allow Tailscale Remote Access",
-    "remoteTailscaleEnabledDescription": "Also listen on Tailscale IP for access from mobile or remote devices.",
-    "remoteTailscaleNotAvailable": "Tailscale is not installed or not running. Please install Tailscale first.",
-    "remoteTailscaleAddress": "Tailscale access address:",
     "codexAuth": "Codex App Enhancements",
     "preserveCodexOfficialAuthOnSwitch": "Keep official login for direct switches",
     "preserveCodexOfficialAuthOnSwitchDescription": "Controls third-party switches when local routing is off. Takeover routing always preserves the Codex official login.",
@@ -4157,7 +4153,24 @@
     "settings": {
       "bindScope": {
         "label": "Binding Scope",
-        "confirm": "Confirm Binding Scope"
+        "confirm": "Confirm Binding Scope",
+        "description": "Which network interfaces the remote management server listens on.",
+        "loopback": "This machine only",
+        "loopbackDescription": "Listen on 127.0.0.1 only. Other devices cannot connect.",
+        "tailscale": "Tailscale only",
+        "tailscaleDescription": "Listen on 127.0.0.1 and your Tailscale IP. Devices in your tailnet can connect.",
+        "allInterfaces": "All network interfaces",
+        "allInterfacesDescription": "Listen on 0.0.0.0. Any device that can reach this machine's LAN or Tailscale address can connect.",
+        "widenTitle": "Widen the binding scope?",
+        "widenTransition": "Current: {{current}} → Target: {{target}}",
+        "newAddresses": "Newly reachable addresses:",
+        "allInterfacesAddress": "All network interfaces (0.0.0.0), port {{port}}",
+        "credentialNote": "Requests from non-loopback sources still require a pairing credential.",
+        "cancel": "Cancel",
+        "applied": "Binding scope updated.",
+        "notApplied": "Binding scope was not changed.",
+        "failed": "Failed to change the binding scope.",
+        "tailscaleUnavailable": "Tailscale is not installed or not running. Please install Tailscale first."
       },
       "cors": {
         "mode": "CORS Mode"

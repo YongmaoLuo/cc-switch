@@ -848,10 +848,6 @@
     "remoteRestartFailed": "リモート管理サーバーの再起動に失敗しました。",
     "remoteStatusRunning": "稼働中",
     "remoteStatusStopped": "停止中",
-    "remoteTailscaleEnabled": "Tailscale リモートアクセスを許可",
-    "remoteTailscaleEnabledDescription": "Tailscale IP でもリッスンし、スマホなどからアクセス可能にします。",
-    "remoteTailscaleNotAvailable": "Tailscale がインストールされていないか実行されていません。先に Tailscale をインストールしてください。",
-    "remoteTailscaleAddress": "Tailscale アクセスアドレス：",
     "codexAuth": "Codex アプリ拡張",
     "preserveCodexOfficialAuthOnSwitch": "直接切替時に公式ログインを保持",
     "preserveCodexOfficialAuthOnSwitchDescription": "ローカルルーティングが無効な場合のサードパーティ切替を制御します。ルーティング接管中は常に Codex の公式ログインを保持します。",
@@ -4157,7 +4153,24 @@
     "settings": {
       "bindScope": {
         "label": "バインド範囲",
-        "confirm": "バインド範囲を確認"
+        "confirm": "バインド範囲を確認",
+        "description": "リモート管理サーバーがリッスンするネットワークインターフェース。",
+        "loopback": "このマシンのみ",
+        "loopbackDescription": "127.0.0.1 のみでリッスンします。他のデバイスは接続できません。",
+        "tailscale": "Tailscale のみ",
+        "tailscaleDescription": "127.0.0.1 と Tailscale IP でリッスンします。テイルネット内のデバイスが接続できます。",
+        "allInterfaces": "すべてのネットワークインターフェース",
+        "allInterfacesDescription": "0.0.0.0 でリッスンします。このマシンの LAN または Tailscale アドレスに到達できる任意のデバイスが接続できます。",
+        "widenTitle": "バインド範囲を広げますか？",
+        "widenTransition": "現在：{{current}} → 対象：{{target}}",
+        "newAddresses": "新たに到達可能になるアドレス：",
+        "allInterfacesAddress": "すべてのネットワークインターフェース（0.0.0.0）、ポート {{port}}",
+        "credentialNote": "非ループバック送信元からのリクエストには引き続きペアリング資格情報が必要です。",
+        "cancel": "キャンセル",
+        "applied": "バインド範囲を更新しました。",
+        "notApplied": "バインド範囲は変更されていません。",
+        "failed": "バインド範囲の変更に失敗しました。",
+        "tailscaleUnavailable": "Tailscale がインストールされていないか実行されていません。先に Tailscale をインストールしてください。"
       },
       "cors": {
         "mode": "CORS モード"
