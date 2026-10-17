@@ -23,7 +23,6 @@ function emit(overrides: Partial<ApprovalEvent["evidence"]> = {}) {
         sourceKind: "tailnet",
         nodeName: "node-under-test",
         nodeStableId: "stable-under-test",
-        hostname: "host-under-test",
         loginName: "peer-under-test@example.invalid",
         isForeignAccount: false,
         peerAddr: "100.64.0.9:4242",

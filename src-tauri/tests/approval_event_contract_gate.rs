@@ -279,8 +279,11 @@ fn approval_evidence_keys_match() {
         "TS 的 ApprovalEvidence",
     );
     compare_key_sets("ApprovalEvidence", &rust_keys, &ts_keys).unwrap();
+    // 反空转下限跟着结构体的字段数走：`ApprovalEvidence` 目前是 6 个字段。删掉那条
+    // 主机名证据字段之前这里是 7 —— 下限必须与真实字段数同步，否则删字段会让门禁
+    // 以「解析器失效」为名误红，而调低下限本身不会让比较变松（键集相等仍是硬条件）。
     assert!(
-        rust_keys.len() >= 7,
+        rust_keys.len() >= 6,
         "ApprovalEvidence 只解析到 {} 个键，解析器多半失效了：{rust_keys:?}",
         rust_keys.len()
     );

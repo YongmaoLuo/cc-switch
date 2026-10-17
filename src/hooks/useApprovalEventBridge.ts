@@ -27,7 +27,6 @@ export interface ApprovalEvidence {
   sourceKind: SourceKind;
   nodeName?: string | null;
   nodeStableId?: string | null;
-  hostname?: string | null;
   loginName?: string | null;
   isForeignAccount: boolean;
   peerAddr: string;

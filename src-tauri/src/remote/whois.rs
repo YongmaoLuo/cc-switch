@@ -63,8 +63,6 @@ pub struct WhoisFields {
     pub node_name: String,
     /// 节点稳定 ID（改名不变，可作长期标识）
     pub node_stable_id: String,
-    /// 主机名
-    pub hostname: String,
     /// 登录名（如 alice@example.com）
     pub login_name: String,
     /// 账号 ID（用于比对 `is_foreign_account`）
@@ -285,15 +283,6 @@ pub fn parse_whois_json(stdout: &str) -> Option<WhoisFields> {
                 &["node", "stable_id"],
                 &["StableID"],
                 &["node_stable_id"],
-            ],
-        ),
-        hostname: dig_str(
-            &root,
-            &[
-                &["Node", "HostName"],
-                &["node", "hostname"],
-                &["HostName"],
-                &["hostname"],
             ],
         ),
         login_name: dig_str(
@@ -714,7 +703,6 @@ mod tests {
             Some(WhoisFields {
                 node_name: "n1".into(),
                 node_stable_id: "s1".into(),
-                hostname: "h1".into(),
                 login_name: "a@b.c".into(),
                 user_id: "u1".into(),
             })

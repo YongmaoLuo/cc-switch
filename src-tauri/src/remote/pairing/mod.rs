@@ -70,27 +70,24 @@ pub fn build_evidence(
     whois: Option<WhoisFields>,
     self_uid: Option<&str>,
 ) -> ApprovalEvidence {
-    let (source_kind, node_name, node_stable_id, hostname, login_name, is_foreign_account) =
-        match whois {
-            Some(fields) => (
-                SourceKind::Tailnet,
-                non_empty(fields.node_name),
-                non_empty(fields.node_stable_id),
-                non_empty(fields.hostname),
-                non_empty(fields.login_name),
-                match self_uid {
-                    Some(self_uid) => !self_uid.is_empty() && self_uid != fields.user_id,
-                    None => false,
-                },
-            ),
-            None => (SourceKind::Unavailable, None, None, None, None, false),
-        };
+    let (source_kind, node_name, node_stable_id, login_name, is_foreign_account) = match whois {
+        Some(fields) => (
+            SourceKind::Tailnet,
+            non_empty(fields.node_name),
+            non_empty(fields.node_stable_id),
+            non_empty(fields.login_name),
+            match self_uid {
+                Some(self_uid) => !self_uid.is_empty() && self_uid != fields.user_id,
+                None => false,
+            },
+        ),
+        None => (SourceKind::Unavailable, None, None, None, false),
+    };
 
     ApprovalEvidence {
         source_kind,
         node_name,
         node_stable_id,
-        hostname,
         login_name,
         is_foreign_account,
         peer_addr: peer.to_string(),
@@ -292,7 +289,6 @@ mod tests {
         WhoisFields {
             node_name: "node-under-test".into(),
             node_stable_id: "stable-under-test".into(),
-            hostname: "host-under-test".into(),
             login_name: "peer-under-test@example.invalid".into(),
             user_id: user_id.into(),
         }
@@ -340,7 +336,6 @@ mod tests {
         assert_eq!(ev.source_kind, SourceKind::Unavailable);
         assert_eq!(ev.node_name, None);
         assert_eq!(ev.node_stable_id, None);
-        assert_eq!(ev.hostname, None);
         assert_eq!(ev.login_name, None);
         assert!(!ev.is_foreign_account, "查不到来源时不得凭空判外来");
         assert_eq!(decide(&ev), ApprovalDecision::ConfirmUnavailable);
