@@ -6,7 +6,9 @@ use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::circuit_breaker::{AllowRequestResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::circuit_breaker::{
+    AllowRequestResult, CircuitBreaker, CircuitBreakerConfig, HalfOpenPermitGuard,
+};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -213,12 +215,26 @@ impl ProviderRouter {
     /// 用于整流器等场景：请求结果不应计入 Provider 健康度，
     /// 但仍需释放占用的探测名额，避免 HalfOpen 状态卡死。
     ///
-    /// 注意：`permit` 由调用方在调用此方法前通过 `permit.take().map(|g| g.disarm())`
-    /// 显式 disarm（或让 guard 自然 Drop），本方法不再接受 `used_half_open_permit: bool`。
-    pub async fn release_permit_neutral(&self, provider_id: &str, app_type: &str) {
+    /// `permit` 由调用方移交进来（不再接受 `used_half_open_permit: bool`）：
+    /// `Some(guard)` 表示这次请求**真的**占到了一个 HalfOpen 名额，`None` 表示没有。
+    /// **`None` 时必须完全不碰熔断器** —— 下面的 `get_or_create_circuit_breaker`
+    /// 会为这家凭空建出一条 (0,0) 的熔断记录，破坏"这家从没被熔断过 ⇒ 查不到记录"
+    /// 的语义（`breaker()` 测试助手与 UI 都依赖它）。
+    pub async fn release_permit_neutral(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        permit: Option<HalfOpenPermitGuard>,
+    ) {
+        let Some(guard) = permit else {
+            return;
+        };
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.release_half_open_permit();
+        // permit 的真正释放由 guard 负责（它与 breaker 共享同一个计数），
+        // 上面那次 release 只是幂等兜底：先减到 0，disarm 见 0 直接返回。
+        guard.disarm();
     }
 
     /// 更新所有熔断器的配置（热更新）
@@ -631,10 +647,11 @@ mod tests {
         assert!(!second.allowed);
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）。
-        // 在调用前手动 disarm guard 让 Drop 变 no-op，避免双重释放。
+        // 把 guard 的所有权移交给它（而不是先 disarm），由它负责释放。
         let first_guard = first.permit.expect("first.permit must be Some");
-        first_guard.disarm();
-        router.release_permit_neutral("a", "claude").await;
+        router
+            .release_permit_neutral("a", "claude", Some(first_guard))
+            .await;
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;

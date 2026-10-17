@@ -598,6 +598,10 @@ pub struct AppSettings {
     // ===== 本机自动迁移状态 =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_migrations: Option<LocalMigrations>,
+
+    // ===== 远程管理 =====
+    /// 是否启用远程管理服务（默认 false）
+    #[serde(default)]
     pub remote_enabled: bool,
     /// 远程管理服务端口（默认 4000）
     #[serde(default = "default_remote_port")]

@@ -622,22 +622,22 @@ pub async fn get_provider_icon(
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProxyControlRequest {
-    /// true  = 启动代理（带 Live 配置接管，覆盖所有 app）
-    /// false = 停止代理（恢复 Live 配置）— 默认
+    /// true  = 启动代理服务（不接管任何 app 的 Live 配置，接管见 /api/proxy/takeover）
+    /// false = 停止代理并让所有 app 退回直连 — 默认
     pub start: bool,
 }
 
 /// POST /api/proxy/control — 统一控制代理的停止与启动
 ///
 /// Body（必填 JSON，必须带 `Content-Type: application/json`）：
-///   - `{}`                          → 停止代理并恢复 Live 配置
-///   - `{"start": true}`             → 启动代理并接管所有 app 的 Live 配置
+///   - `{}`                          → 停止代理并让所有 app 退回直连
+///   - `{"start": true}`             → 启动代理服务
 ///   - `{"start": false}`            → 停止代理（与 `{}` 等价）
 ///
 /// 注意：Body 必填（axum `Json` extractor）。不带 `Content-Type: application/json`
 /// 的请求（跨站表单提交、不带 Content-Type 的 `fetch`）会被 415 拒绝，因此这些
-/// CORS 简单请求无法触发 `stop_with_restore()`（它会停代理、清除各 app 的 enabled
-/// 标记并删除 live 备份）——这正是把 extractor 设为必填的原因。
+/// CORS 简单请求无法触发停止分支（它会停代理、让各 app 退回直连并删除 live
+/// 备份）——这正是把 extractor 设为必填的原因。
 ///
 /// 远程调用前必须停止代理，否则开发版本启动后会因 single-instance 冲突
 /// 导致生产进程被抢占，进而使正在运行的 Agent 无法调用模型。
@@ -656,13 +656,24 @@ pub async fn proxy_control(
     let start = body.start;
 
     if start {
-        // 启动代理 + 接管所有 app 的 Live 配置。
-        // 幂等：start_with_takeover() 内部会先 is_running() 检查；
-        // 如果 Live config 已被接管且指向当前代理，set_takeover_for_app 也会早退。
-        match app_state.proxy_service.start_with_takeover().await {
+        // 启动代理服务。上游 4.0.14 把 `start_with_takeover` 折进 `mode::controller`：
+        // 「拉起服务」与「接管某个 app 的 Live 配置」现在是两件事，后者走
+        // `set_proxy_takeover_for_app`（对应本文件的 `/api/proxy/takeover`）。
+        // 这里与桌面命令 `commands::proxy::start_proxy_server` 停在同一层：
+        // 只把服务拉起来，不替用户改写任何 app 的 Live 配置。
+        // 幂等：`ProxyService::start()` 内部（`start_server`）会先看 is_running()，
+        // 已在跑时直接回当前地址/端口。
+        match app_state.proxy_service.start().await {
             Ok(info) => {
+                // 与 `commands::proxy::start_proxy_server` 对称，让桌面 UI 通过 SSE
+                // invalidate（远程 API 改状态后 UI 不刷新是历史上出过的回归）。
+                app_state.proxy_service.broadcast_event(json!({
+                    "type": "proxy_started",
+                    "address": info.address,
+                    "port": info.port,
+                }));
                 log::info!(
-                    "[Remote] Proxy started and live configs taken over via API: {}:{}",
+                    "[Remote] Proxy started via API: {}:{}",
                     info.address,
                     info.port
                 );
@@ -682,8 +693,13 @@ pub async fn proxy_control(
             }
         }
     } else {
-        match app_state.proxy_service.stop_with_restore().await {
+        // 与桌面命令 `commands::proxy::stop_proxy_with_restore` 同层：所有 app 退回直连，
+        // 再停服务（`stop_with_restore` 已被上游折进 `mode::controller`）。
+        match crate::mode::controller::exit_all(app_state.inner()).await {
             Ok(()) => {
+                app_state
+                    .proxy_service
+                    .broadcast_event(json!({"type": "proxy_stopped"}));
                 log::info!("[Remote] Proxy stopped and live configs restored via API");
                 Json(json!({"success": true, "action": "stop"})).into_response()
             }
@@ -707,10 +723,17 @@ pub struct ProxyTakeoverRequest {
 /// POST /api/proxy/takeover — 为指定应用开启/关闭代理接管
 ///
 /// Body: {"appType": "claude", "enabled": true}
+///
+/// 与桌面命令 `commands::proxy::set_proxy_takeover_for_app` 同层：开启走
+/// `mode::controller::enter_with_route`（内部会按需把代理服务拉起来），关闭走
+/// `mode::controller::exit`。远程请求没有确认框，所以 `stack` 固定 false（路由
+/// 模式）、`route` 传 `None` 沿用上次的路由 —— 与桌面点「开启」不选目标时一致。
 pub async fn proxy_takeover(
     AxumState(state): AxumState<Arc<RemoteState>>,
     Json(body): Json<ProxyTakeoverRequest>,
 ) -> impl IntoResponse {
+    use std::str::FromStr;
+
     if !state.running.load(Ordering::SeqCst) {
         return remote_error(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -720,11 +743,27 @@ pub async fn proxy_takeover(
 
     let app_state = app_state(&state);
 
-    match app_state
-        .proxy_service
-        .set_takeover_for_app(&body.app_type, body.enabled)
-        .await
-    {
+    // 与 `commands::proxy::require_mode_app` 同一条校验（错误文案也一致）。
+    let app = match AppType::from_str(&body.app_type) {
+        Ok(app) => app,
+        Err(e) => {
+            return remote_error(axum::http::StatusCode::OK, format!("无效的应用类型: {e}"));
+        }
+    };
+    if !app.has_route_mode() {
+        return remote_error(
+            axum::http::StatusCode::OK,
+            format!("{} 不支持本地路由", app.as_str()),
+        );
+    }
+
+    let result = if body.enabled {
+        crate::mode::controller::enter_with_route(app_state.inner(), &app, false, None).await
+    } else {
+        crate::mode::controller::exit(app_state.inner(), &app).await
+    };
+
+    match result {
         Ok(()) => {
             log::info!(
                 "[Remote] Proxy takeover for {} set to {} via API",
@@ -788,13 +827,20 @@ pub async fn proxy_failover(
                 }
             };
 
-            let current_id =
-                match crate::settings::get_effective_current_provider(&app_state.db, &app_enum) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        return remote_error(axum::http::StatusCode::OK, e);
-                    }
-                };
+            // 与桌面命令 `commands::failover::set_auto_failover_enabled` 同层：上游
+            // 4.0.14 要求「读当前供应商」一律经 `mode::current::provider_for` 并说明
+            // 用途（`mode::current` 那条源码门禁会拦下裸读）。故障转移队列的 P1 要
+            // 排的是**正在用的那家**，所以是 `Purpose::InUse`，与桌面命令逐字一致。
+            let current_id = match crate::mode::current::provider_for(
+                &app_state.db,
+                &app_enum,
+                crate::mode::current::Purpose::InUse,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    return remote_error(axum::http::StatusCode::OK, e.to_string());
+                }
+            };
 
             let Some(current_id) = current_id else {
                 return remote_error(
@@ -846,10 +892,23 @@ pub async fn proxy_failover(
 
     // 开启后立即切到 P1
     if body.enabled {
-        if let Err(e) = app_state
-            .proxy_service
-            .switch_proxy_target(&body.app_type, &p1_provider_id)
-            .await
+        let app_enum = match crate::app_config::AppType::from_str(&body.app_type) {
+            Ok(a) => a,
+            Err(e) => {
+                return remote_error(axum::http::StatusCode::OK, format!("无效的应用类型: {e}"));
+            }
+        };
+
+        // 与桌面命令 `commands::failover::set_auto_failover_enabled` 同层：上游 4.0.14
+        // 用 `mode::controller::switch_route_for_failover` 取代了
+        // `ProxyService::switch_proxy_target`（后者已删）。故障转移不走聚合模式，
+        // 所以用带这个拒绝的入口，而不是通用的 `switch_route`。
+        if let Err(e) = crate::mode::controller::switch_route_for_failover(
+            app_state.inner(),
+            &app_enum,
+            &p1_provider_id,
+        )
+        .await
         {
             return remote_error(axum::http::StatusCode::OK, e);
         }
@@ -1098,13 +1157,11 @@ pub async fn test_provider(
     let app_state = app_state(&state);
     let copilot_state = copilot_state(&state);
 
-    // 与 Tauri 命令 stream_check_provider 完全相同的逻辑路径
-    let config = match app_state.db.get_stream_check_config() {
-        Ok(c) => c,
-        Err(e) => {
-            return remote_error(axum::http::StatusCode::OK, e);
-        }
-    };
+    // 与 Tauri 命令 stream_check_provider 完全相同的逻辑路径：上游 4.0.14 删掉了
+    // `stream_check_config` 的持久化（连带 `get_stream_check_config` /
+    // `save_stream_check_config` / `save_stream_check_log` 三个 Dao 方法），
+    // 命令层因此改用 `StreamCheckConfig::default()`，这里照搬。
+    let config = crate::services::stream_check::StreamCheckConfig::default();
 
     let providers = match app_state.db.get_all_providers(app_type.as_str()) {
         Ok(p) => p,
@@ -1147,13 +1204,9 @@ pub async fn test_provider(
         }
     };
 
-    // 复用 Tauri 命令的 stream_check_log 记录
-    let _ = app_state.db.save_stream_check_log(
-        &body.provider_id,
-        &provider.name,
-        app_type.as_str(),
-        &result,
-    );
+    // 上游 4.0.14 一并删掉了 `stream_check_log` 的写入（`save_stream_check_log`
+    // 这个 Dao 方法已不存在，只剩 `cleanup_old_stream_check_logs`）：桌面命令
+    // `stream_check_provider` 现在也不再落库，这里与它保持一致。
 
     let status_str = serde_json::to_string(&result.status)
         .unwrap_or_else(|_| "\"unknown\"".to_string())
@@ -1177,10 +1230,11 @@ pub async fn test_provider(
         "message": redact::redact_error(&result.message),
         "response_time_ms": result.response_time_ms,
         "http_status": result.http_status,
-        "model_used": result.model_used,
         "tested_at": result.tested_at,
+        // `model_used` / `error_category` 随上游 4.0.14 一起没了：`StreamCheckResult`
+        // 已删掉这两个字段（持久化一并删除）。已核对 `src/remote/html.rs` 内嵌 UI、
+        // `src/` 前端与 `src-tauri/src/remote/e2e.rs`，没有任何一处读它们。
         "retry_count": result.retry_count,
-        "error_category": result.error_category,
     }))
     .into_response()
 }
@@ -1441,8 +1495,8 @@ mod tests {
     /// `"error":` 夹在行中间。只匹配行首的写法会把这个洞原样放过。
     ///
     /// 匹配 `"error":` / `"message":`（`json!` 的字符串键）与 `error:` /
-    /// `message:`（DTO 字段名）。`"error_category":` 不会被误伤 —— 它不等于
-    /// `"error":`，是分类字段而非上游原文。
+    /// `message:`（DTO 字段名）。匹配的是带引号的完整键，不是子串，所以键名里
+    /// 含 `error` 但另起一个词的（例如 `"error_counts":`）不会被误伤。
     fn is_error_payload_line(line: &str) -> bool {
         line.contains("\"error\":")
             || line.contains("\"message\":")
@@ -1496,9 +1550,10 @@ mod tests {
     #[test]
     fn test_provider_error_fields_go_through_redaction() {
         let body = fn_body(HANDLERS_SRC, "pub async fn test_provider");
-        // 尾部哨兵：确认没有把后面的 handler 截进来。
+        // 尾部哨兵：确认没有把后面的 handler 截进来。取响应载荷里**最后一个**键
+        // （`model_used` / `error_category` 随上游 4.0.14 删除后，末键是 retry_count）。
         assert!(
-            body.contains("\"error_category\""),
+            body.contains("\"retry_count\""),
             "test_provider body extraction looks truncated: {body}"
         );
 

@@ -65,6 +65,11 @@ const REQUIRE_ENV: &str = "CC_SWITCH_REQUIRE_TAILNET";
 /// The job that runs the default Rust suite on the three-OS matrix.
 const BACKEND_JOB: &str = "backend";
 
+/// The job that decides which change surfaces were touched. Its `outputs:` are
+/// the other legal place to guarantee "定时 / 手动那一次一定跑" — see
+/// `non_pr_events_run_anyway`.
+const CHANGES_JOB: &str = "changes";
+
 /// The job that legitimately runs one pre-existing `#[ignore]`d case, because
 /// it needs a WSL2 UNC path no other runner provides.
 const WSL_JOB: &str = "backend-windows-wsl2";
@@ -542,6 +547,19 @@ fn ignore_detector_separates_code_from_prose() {
 // 3. The default `cargo test` is what CI runs
 // ---------------------------------------------------------------------------
 
+/// 这个 job 真的在跑「默认那一套 Rust 测试」吗 —— 命令是 `cargo test`（不额外收窄）
+/// 还是 `cargo nextest run`（同样不额外收窄）都算，两者只是 runner 不同。
+///
+/// 判据的原意是「默认测试套件必须由 CI 真跑，新增用例不许只活在某个额外命令里」，
+/// 不是把某个二进制钉死。上游 4.0.14 把 `backend` 换成了 nextest（每个用例一个进程
+/// + 超时），所以这里跟随上游的工具链放宽到 nextest —— **放宽的只有 runner，
+/// 没有放宽「必须不带收窄参数」那一半**（收窄仍由下面的 narrowing 断言把关）。
+fn runs_default_test_suite(runnable: &str) -> bool {
+    const CARGO_TEST: &str = "cargo test --manifest-path src-tauri/Cargo.toml";
+    const NEXTEST: &str = "cargo nextest run --manifest-path src-tauri/Cargo.toml";
+    runnable.contains(CARGO_TEST) || runnable.contains(NEXTEST)
+}
+
 #[test]
 fn rust_job_runs_default_cargo_test() {
     let yaml = read_workflow();
@@ -553,8 +571,9 @@ fn rust_job_runs_default_cargo_test() {
         let runnable = strip_yaml_comments(&job);
 
         assert!(
-            runnable.contains("cargo test --manifest-path src-tauri/Cargo.toml"),
-            "{job_name} 必须跑不带过滤参数的默认 `cargo test` —— 本轮新增的用例全在它里面\n\
+            runs_default_test_suite(&runnable),
+            "{job_name} 必须跑不带过滤参数的默认测试套件（`cargo test` 或 \
+             `cargo nextest run`，都要点名 src-tauri/Cargo.toml）—— 本轮新增的用例全在它里面\n\
              --- job ---\n{job}"
         );
 
@@ -566,6 +585,38 @@ fn rust_job_runs_default_cargo_test() {
                  --- job ---\n{job}"
             );
         }
+    }
+
+    // `runs_default_test_suite` 的负控：判据必须能红。
+    //
+    // 这一条覆盖的是「默认套件跑没跑」这个判据本身。没有它，判据可以被悄悄换成
+    // 一个恒真的形式（或者反过来，两个 runner 的名字都被写错），而门禁一声不吭。
+    for fixture in [
+        // 只跑了前端，Rust 侧完全没跑
+        "  backend:\n    steps:\n      - run: pnpm test:unit\n",
+        // nextest 但没点名 crate（`cd` 进去再跑）—— 与本文件对 `cargo test` 的
+        // 要求同一把尺子：必须显式写 --manifest-path src-tauri/Cargo.toml
+        "  backend:\n    steps:\n      - run: cargo nextest run --profile ci\n",
+        // 既不是 cargo test 也不是 nextest
+        "  backend:\n    steps:\n      - run: cargo build --manifest-path src-tauri/Cargo.toml\n",
+    ] {
+        let job = job_block(fixture, BACKEND_JOB).expect("fixture declares backend");
+        assert!(
+            !runs_default_test_suite(&strip_yaml_comments(&job)),
+            "负向夹具必须被判为没跑默认测试套件，否则判据不会生效：\n{fixture}"
+        );
+    }
+
+    // 正控：两个 runner 的合法形态都必须被认下，否则「放宽到 nextest」只是嘴上说说。
+    for fixture in [
+        "  backend:\n    steps:\n      - run: cargo test --manifest-path src-tauri/Cargo.toml\n",
+        "  backend:\n    steps:\n      - run: cargo nextest run --manifest-path src-tauri/Cargo.toml --profile ci\n",
+    ] {
+        let job = job_block(fixture, BACKEND_JOB).expect("fixture declares backend");
+        assert!(
+            runs_default_test_suite(&strip_yaml_comments(&job)),
+            "正控夹具必须被认下（否则判据过严，等于把上游的 nextest 判成违规）：\n{fixture}"
+        );
     }
 
     // 没有回退既有门禁：那一条 `#[ignore]` 是有理由的（要 WSL2 UNC 路径），
@@ -621,6 +672,21 @@ fn rust_job_runs_default_cargo_test() {
 // 4. Triggering is layered by change surface
 // ---------------------------------------------------------------------------
 
+/// 定时 / 手动那一次（非 PR 事件）这个改动面保证会跑吗 —— 缓存要靠它养热。
+///
+/// 两种写法语义等价，都算数，因为两边的 CI 各用了一种：
+///
+/// - **job 自己短路**：`if: github.event_name != 'pull_request' || needs.changes.outputs.X == 'true'`；
+/// - **`changes` 输出兜底**：`X: ${{ steps.filter.outputs.X || 'true' }}` —— 过滤步骤只在
+///   PR / push 上跑，定时与手动触发下它被跳过、输出为空，`|| 'true'` 把空值补成真。
+///
+/// 只认其中一种，就会把另一种形态判成违规。**两种都没有才判红**（负控见下）——
+/// 那意味着定时全量那次这个 job 静默不跑，而报告里看不出来。
+fn non_pr_events_run_anyway(cond: &str, changes_job: &str, filter: &str) -> bool {
+    cond.contains("github.event_name != 'pull_request'")
+        || changes_job.contains(&format!("outputs.{filter} || 'true'"))
+}
+
 #[test]
 fn workflow_triggers_by_change_surface() {
     let yaml = read_workflow();
@@ -632,6 +698,9 @@ fn workflow_triggers_by_change_surface() {
              remote/auth/pairing 改动走 Rust 全套 + 静态门禁，前端 src/i18n 改动走 vitest"
         );
     }
+
+    let changes_job = job_block(&yaml, CHANGES_JOB)
+        .unwrap_or_else(|| panic!("ci.yml 必须有 `{CHANGES_JOB}` job"));
 
     // 每个 job 的 `if:` 必须挂在对应的改动面上，而不是无差别跑或无差别不跑。
     let expectations = [
@@ -649,8 +718,11 @@ fn workflow_triggers_by_change_surface() {
             "{job_name} 的 if: 必须读 `changes.outputs.{filter}`，实际是：{cond}"
         );
         assert!(
-            cond.contains("github.event_name != 'pull_request'"),
-            "{job_name} 在 push 到 main 时必须无条件跑完，维持缓存温度；实际是：{cond}"
+            non_pr_events_run_anyway(&cond, &changes_job, filter),
+            "{job_name} 在定时全量 / push 到 main / 手动触发时必须跑完，维持缓存温度。\
+             要么 `if:` 里写 `github.event_name != 'pull_request' || ...`，要么 `{CHANGES_JOB}` job 的 \
+             `outputs.{filter}` 兜底成 `|| 'true'`；两种都没有时，那一次它静默不跑。\
+             实际 if: = {cond}"
         );
     }
 
@@ -661,5 +733,42 @@ fn workflow_triggers_by_change_surface() {
     assert!(
         !cond.contains("changes.outputs.backend"),
         "负向夹具（if: 不读改动面）必须被判为不合规，否则分层判据不会生效：{cond}"
+    );
+
+    // 负控二：两种「非 PR 也跑」的写法都没有 → 必须判红。
+    let no_fallback = concat!(
+        "  changes:\n    outputs:\n      backend: ${{ steps.filter.outputs.backend }}\n",
+        "  backend:\n    if: needs.changes.outputs.backend == 'true'\n",
+    );
+    let changes_job = job_block(no_fallback, CHANGES_JOB).expect("fixture declares changes");
+    let job = job_block(no_fallback, BACKEND_JOB).expect("fixture declares backend");
+    let cond = job_condition(&job).expect("fixture has if:");
+    assert!(
+        !non_pr_events_run_anyway(&cond, &changes_job, "backend"),
+        "负控：if: 不看事件、changes 输出也不兜底时必须判红，\
+         否则「定时全量真的会跑」这条无从证明"
+    );
+
+    // 正控：两条合法路径各自都必须被认下，否则门禁会把其中一种形态误判成违规。
+    let via_cond = concat!(
+        "  changes:\n    outputs:\n      backend: ${{ steps.filter.outputs.backend }}\n",
+        "  backend:\n    if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'\n",
+    );
+    let changes_job = job_block(via_cond, CHANGES_JOB).expect("fixture declares changes");
+    let cond = job_condition(&job_block(via_cond, BACKEND_JOB).expect("fixture")).expect("if:");
+    assert!(
+        non_pr_events_run_anyway(&cond, &changes_job, "backend"),
+        "正控：`if:` 里短路这一种形态必须被认下"
+    );
+
+    let via_outputs = concat!(
+        "  changes:\n    outputs:\n      backend: ${{ steps.filter.outputs.backend || 'true' }}\n",
+        "  backend:\n    if: needs.changes.outputs.backend == 'true'\n",
+    );
+    let changes_job = job_block(via_outputs, CHANGES_JOB).expect("fixture declares changes");
+    let cond = job_condition(&job_block(via_outputs, BACKEND_JOB).expect("fixture")).expect("if:");
+    assert!(
+        non_pr_events_run_anyway(&cond, &changes_job, "backend"),
+        "正控：`changes` 输出兜底这一种形态必须被认下"
     );
 }

@@ -31,6 +31,7 @@ fn test_app_type_serde_uses_wire_names() {
         (AppType::OpenClaw, "\"openclaw\""),
         (AppType::Hermes, "\"hermes\""),
         (AppType::Pi, "\"pi\""),
+        (AppType::Mcode, "\"mcode\""),
     ];
 
     // 变体数量对不上说明上面漏了新变体，先让这条失败再加。
