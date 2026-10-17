@@ -273,7 +273,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let error = reqwest::Client::new()
+        // 必须显式关代理：reqwest 0.12 默认带 `system-proxy`，会去读操作系统的
+        // 代理设置。开发机开着系统代理时，这条通往刚释放的回环端口的请求会被送进
+        // 代理，拿回一个 502 而不是「连接被拒绝」—— 断言于是炸在代理身上，而不是
+        // 炸在它想验的东西上。这个用例要验的是 `describe_reqwest_error` 对连接
+        // 错误的处理，与代理无关。
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!(
                 "http://127.0.0.1:{port}/v1/responses?key=secret-token"
             ))
