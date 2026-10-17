@@ -56,11 +56,14 @@
 //! 矩阵：`peer` 那一列若被替换成常量，上面会有一批格子转红。
 
 use super::auth::{
-    load_clients, load_or_create, parse_session_cookie, save_clients, token_hash, AuthScope,
-    ClientToken, SecretError, AUTH_SUBDIR, REMOTE_LISTENER_IS_TLS, SECRET_FILE,
+    generate_token, load_clients, load_or_create, parse_session_cookie, save_clients, token_hash,
+    AuthScope, ClientToken, SecretError, AUTH_SUBDIR, REMOTE_LISTENER_IS_TLS, SECRET_FILE,
 };
+use super::config::startup_remote_config;
 use super::events::{EventSink, RecordingSink};
-use super::{allowed_origins, redact, RemoteApp, RemoteConfig, RemoteServer, ROUTE_SCOPE_TABLE};
+use super::{
+    allowed_origins, redact, BindScope, RemoteApp, RemoteConfig, RemoteServer, ROUTE_SCOPE_TABLE,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -340,7 +343,7 @@ async fn start_headless_bound(
 
     // 收集 abort handle 供 Drop 兜底（私有字段，本模块是 remote 的子模块，够得着）
     let abort_handles: Vec<tokio::task::AbortHandle> = {
-        let listeners = server.listeners.read().await;
+        let listeners = server.state.listeners.read().await;
         listeners
             .values()
             .map(|e| e.handle.abort_handle())
@@ -355,6 +358,228 @@ async fn start_headless_bound(
         server,
         abort_handles,
     }
+}
+
+/// 抢一个当前空闲的本地端口（先绑后放）。
+///
+/// 只给 E2E 用：`port: 0` 在 Tailscale 档位上会让 loopback 与 tailscale 两个
+/// listener 各拿一个**不同**的临时端口，而生产配置里它们是同一个端口。
+/// 因此按档位起服务时必须显式给一个真实端口。
+pub fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("probe listener for a free port");
+    let port = probe.local_addr().expect("probe local addr").port();
+    drop(probe);
+    port
+}
+
+/// 按**生产绑定路径**（`compute_target_addrs`）起一个 headless server。
+///
+/// 与 [`start_headless_on`] 的差别：那里绑定地址由用例直接给；这里给的是
+/// `RemoteConfig`，地址从 `bind_scope` 算出来 —— 这正是本文件要验的那段逻辑。
+///
+/// `ttl` 只对两段式确认的 pending 记录生效；给 `Some` 是为了在几百毫秒内验到
+/// 「过期后确认被拒」，而不是真的 sleep 五分钟。
+pub async fn start_headless_configured(
+    config: RemoteConfig,
+    ttl: Option<Duration>,
+    recording: RecordingSink,
+) -> Harness {
+    let cfg_dir = tempfile::tempdir().expect("create isolated temp config dir");
+    start_headless_configured_in(
+        cfg_dir.path().to_path_buf(),
+        Some(cfg_dir),
+        config,
+        ttl,
+        recording,
+    )
+    .await
+}
+
+/// [`start_headless_configured`] 的「目录归调用方」版本：重启用例要复用同一个
+/// 凭据目录，不能被 Harness 的 Drop 删掉。
+pub async fn start_headless_configured_in(
+    config_dir: PathBuf,
+    cfg_owner: Option<tempfile::TempDir>,
+    config: RemoteConfig,
+    ttl: Option<Duration>,
+    recording: RecordingSink,
+) -> Harness {
+    let port = config.port;
+    let sink: Arc<dyn EventSink> = Arc::new(recording.clone());
+    let server = match ttl {
+        Some(ttl) => {
+            RemoteServer::new_with_ttl(RemoteApp::headless(), sink, config, config_dir.clone(), ttl)
+        }
+        None => RemoteServer::new(RemoteApp::headless(), sink, config, config_dir.clone()),
+    }
+    .expect("headless server must prepare its isolated auth dir");
+
+    let server = Arc::new(server);
+    let urls = server
+        .start()
+        .await
+        .expect("server must bind at least one address");
+
+    // `0.0.0.0` 不是客户端能直接用的目的地址：AllInterfaces 档位用回环验证
+    // 「服务确实起来了」，非回环目的地址由对应用例单独探测。
+    let base_url = urls
+        .iter()
+        .find(|url| url.contains("127.0.0.1"))
+        .cloned()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+
+    let abort_handles: Vec<tokio::task::AbortHandle> = {
+        let listeners = server.state.listeners.read().await;
+        listeners
+            .values()
+            .map(|entry| entry.handle.abort_handle())
+            .collect()
+    };
+
+    Harness {
+        base_url,
+        cfg_dir: config_dir,
+        cfg_owner,
+        recording,
+        server,
+        abort_handles,
+    }
+}
+
+/// 往夹具的凭据目录里写若干条真实凭据，返回明文 token。
+///
+/// 走生产同一套 `ClientToken::new` + `save_clients`：两个会话的区分靠的是真实
+/// 摘要，而不是测试里编出来的身份字符串。
+fn issue_tokens(cfg_dir: &Path, names: &[&str]) -> Vec<String> {
+    let secret = load_or_create(cfg_dir).expect("secret in the isolated dir");
+    let mut clients = Vec::new();
+    let mut tokens = Vec::new();
+    for name in names {
+        let token = generate_token();
+        clients.push(ClientToken::new(name, &secret, &token));
+        tokens.push(token);
+    }
+    save_clients(cfg_dir, &clients).expect("persist client tokens");
+    tokens
+}
+
+/// 带着 `Authorization: Bearer` 发一个 JSON POST。
+async fn post_json_with_token(
+    base: &str,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {path} must reach the live listener: {e}"))
+}
+
+/// 断言某个目的地址**确实没人监听**：连接层必须是 `ConnectionRefused`，
+/// 而不是「碰巧超时」或「连上后 401」。后两者都不能证明 listener 没绑。
+async fn assert_connection_refused(source: IpAddr, destination: SocketAddr) {
+    match tcp_connect_from(Some(source), destination).await {
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{destination} 必须被拒绝连接（listener 不存在），实际错误：{error}"
+        ),
+        Ok(_) => panic!("{destination} 不应有人监听，实际连上了"),
+    }
+}
+
+/// 从指定来源地址（`None` = 系统选择）做一次真实 TCP 连接。
+///
+/// 「连不上」必须是连接层的失败，而不是 HTTP 层 401 —— 本功能的价值全在
+/// listener 到底绑没绑；用状态码代替连接结果会把「没绑」验成「绑了但鉴权拒绝」。
+async fn tcp_connect_from(
+    source: Option<IpAddr>,
+    destination: SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    if let Some(ip) = source {
+        socket.bind(SocketAddr::new(ip, 0))?;
+    }
+    match tokio::time::timeout(Duration::from_secs(2), socket.connect(destination)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timed out",
+        )),
+    }
+}
+
+/// 从指定来源地址发一发 GET，返回 HTTP 状态码。
+async fn get_status_from_source(
+    source: IpAddr,
+    destination: SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+) -> reqwest::Result<u16> {
+    let client = reqwest::Client::builder()
+        .local_address(source)
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client");
+    let mut request = client.get(format!("http://{destination}{path}"));
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    request
+        .send()
+        .await
+        .map(|response| response.status().as_u16())
+}
+
+/// 与 [`get_status_from_source`] 相同，但对**连接层**失败做有界重试。
+///
+/// 为什么需要：macOS 的「本地网络」隐私权限 / 路由预热会让进程里**第一条**到
+/// 本机非回环地址的连接偶发超时（TCP 已进 backlog，数据发不出去）。这是
+/// 操作系统的一次性成本，不是被测代码的行为。重试只发生在 `reqwest::Error`
+/// 上，HTTP 状态码本身仍然原样返回 —— 断言没有被放宽。
+async fn get_status_from_source_retrying(
+    source: IpAddr,
+    destination: SocketAddr,
+    path: &str,
+    bearer: Option<&str>,
+) -> u16 {
+    let mut last_error = None;
+    for attempt in 0..5u64 {
+        match get_status_from_source(source, destination, path, bearer).await {
+            Ok(status) => return status,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!(
+        "GET http://{destination}{path} never reached the listener after 5 attempts: {:?}",
+        last_error
+    );
+}
+
+/// 与 [`tcp_connect_from`] 相同，但用于「必须连上」的断言（同一段 OS 预热成本）。
+async fn tcp_connect_from_retrying(
+    source: Option<IpAddr>,
+    destination: SocketAddr,
+) -> tokio::net::TcpStream {
+    let mut last_error = None;
+    for attempt in 0..5u64 {
+        match tcp_connect_from(source, destination).await {
+            Ok(stream) => return stream,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("{destination} was never reachable after 5 attempts: {last_error:?}");
 }
 
 /// 正常收尾：关 listener、join 任务。
@@ -2754,13 +2979,16 @@ async fn cors_origin_denial_precedes_credential_gate() {
 ///
 /// 顺序与 [`protected_paths`] 扣掉只读项后的顺序一致，这样下面那条「由路由表
 /// 反推」的断言可以直接整表比较。
-const WRITE_ROUTES: [&str; 6] = [
+const WRITE_ROUTES: [&str; 9] = [
     "/api/switch",
     "/api/reorder",
     "/api/proxy/control",
     "/api/proxy/takeover",
     "/api/proxy/failover",
     "/api/provider/test",
+    "/api/remote/config/bind-scope/request",
+    "/api/remote/config/bind-scope/confirm",
+    "/api/remote/config/bind-scope/reject",
 ];
 
 /// `Protected` 分区里唯一的几条**只读**路由。
@@ -2820,7 +3048,7 @@ async fn cross_site_fetch_without_content_type(base: &str, path: &str) -> reqwes
         .unwrap_or_else(|e| panic!("无 Content-Type 的跨站 POST {path} 必须打到活的 listener：{e}"))
 }
 
-/// 六条写路由的跨站形态一律 403。
+/// 九条写路由的跨站形态一律 403。
 ///
 /// 每一格发的是**浏览器真会发出去**的那一发：外站 `Origin` + CORS 简单请求
 /// 语义（表单提交 / 不带 `Content-Type` 的 fetch）。普通 JSON POST 测不到这条：
@@ -2850,7 +3078,7 @@ async fn csrf_cross_site_post_on_all_write_routes_is_403() {
     assert_eq!(
         derived,
         WRITE_ROUTES.to_vec(),
-        "Protected 分区扣掉只读项之后必须**恰好**是这六条写路由。\
+        "Protected 分区扣掉只读项之后必须**恰好**是这九条写路由。\
          对不上说明：新增了写路由却没加进 WRITE_ROUTES（CSRF 断言会静默放过它），\
          或者有路由被挪出了 Protected 分区。实测路由表反推得 {derived:?}"
     );
@@ -4080,7 +4308,7 @@ async fn teardown_leaves_no_running_task() {
     let server = Arc::clone(&h.server);
 
     assert_eq!(
-        server.listeners.read().await.len(),
+        server.state.listeners.read().await.len(),
         1,
         "headless 只应起一个 loopback listener"
     );
@@ -4088,7 +4316,7 @@ async fn teardown_leaves_no_running_task() {
     teardown(h).await;
 
     assert!(
-        server.listeners.read().await.is_empty(),
+        server.state.listeners.read().await.is_empty(),
         "stop() 之后 listener 表必须被清空 —— 还有条目就意味着某个 listener 任务\
          仍在跑（或没被 join）"
     );
@@ -4772,4 +5000,511 @@ mod tests {
 
         teardown(h).await;
     }
+}
+
+// ===========================================================================
+// 绑定范围三档位：真实 socket、真实绑定、真实连接
+// ===========================================================================
+//
+// 这一族不用 mock 替换绑定行为 —— 本功能的价值全在「真的绑了」。每条用例都
+// 从生产路径起服务（`RemoteConfig` → `compute_target_addrs` → `start`），再用
+// 真实 TCP / HTTP 从回环与非回环来源各探一次：
+//
+// - 「连不上」= 连接层失败（RST / timeout），不是 401；
+// - 「连上了但没凭据」= 401（非回环来源仍然必须持有配对凭证）。
+//
+// 非回环来源由 [`nonloopback_source`] 探测，目的地址用同一块地址：本机连本机
+// 的 LAN IP 不会离开机器，也不依赖对外网络。
+
+fn loopback_only(port: u16) -> RemoteConfig {
+    RemoteConfig {
+        enabled: true,
+        port,
+        bind_scope: BindScope::Loopback,
+        ..RemoteConfig::default()
+    }
+}
+
+fn with_scope(port: u16, bind_scope: BindScope) -> RemoteConfig {
+    RemoteConfig {
+        enabled: true,
+        port,
+        bind_scope,
+        ..RemoteConfig::default()
+    }
+}
+
+async fn request_widening(h: &Harness, token: &str, target: &str) -> String {
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/request",
+        token,
+        serde_json::json!({ "scope": target }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "widening request must be accepted");
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["applied"], serde_json::json!(false));
+    assert_eq!(
+        body["bindScope"],
+        serde_json::json!("loopback"),
+        "待确认期间生效值必须还是旧档位：{body}"
+    );
+    body["confirmationId"]
+        .as_str()
+        .expect("widening must return a confirmation id")
+        .to_string()
+}
+
+/// 第 1 条：`Loopback` 档位下，LAN 目的地址根本没有人监听。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_loopback_is_not_reachable_on_lan() {
+    let src = match nonloopback_source().await {
+        Ok(src) => src,
+        Err(why) => {
+            eprintln!("SKIP e2e_bind_scope_loopback_is_not_reachable_on_lan: {why}");
+            return;
+        }
+    };
+
+    let port = free_port();
+    let h = start_headless_configured(loopback_only(port), None, RecordingSink::new()).await;
+
+    // 回环仍然可用。
+    let status = reqwest::get(format!("{}/api/health", h.base_url))
+        .await
+        .expect("loopback request")
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "Loopback 档位下 127.0.0.1 必须可用");
+
+    // LAN 目的地址：连接层必须失败。
+    assert_connection_refused(src.ip, SocketAddr::new(src.ip, port)).await;
+
+    teardown(h).await;
+}
+
+/// 第 2 条：`AllInterfaces` 档位下，非回环目的地址可达，但**仍然要凭据**。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_all_interfaces_reaches_lan_but_requires_credential() {
+    let src = match nonloopback_source().await {
+        Ok(src) => src,
+        Err(why) => {
+            eprintln!(
+                "SKIP e2e_bind_scope_all_interfaces_reaches_lan_but_requires_credential: {why}"
+            );
+            return;
+        }
+    };
+
+    let port = free_port();
+    let h = start_headless_configured(
+        with_scope(port, BindScope::AllInterfaces),
+        None,
+        RecordingSink::new(),
+    )
+    .await;
+    let token = issue_tokens(&h.cfg_dir, &["lan-client"]).remove(0);
+    let destination = SocketAddr::new(src.ip, port);
+
+    // 真实 TCP：0.0.0.0 绑定让这块网卡上的端口真的开了。
+    tcp_connect_from_retrying(Some(src.ip), destination).await;
+
+    // 但可达 ≠ 可用：非回环来源没有凭据必须 401，不是 200。
+    let unauthenticated =
+        get_status_from_source_retrying(src.ip, destination, "/api/health", None).await;
+    assert_eq!(
+        unauthenticated, 401,
+        "非回环来源未带凭据必须是 401，而不是 {unauthenticated}"
+    );
+
+    let authenticated =
+        get_status_from_source_retrying(src.ip, destination, "/api/health", Some(&token)).await;
+    assert_eq!(authenticated, 200, "带配对凭证的非回环请求必须放行");
+
+    teardown(h).await;
+}
+
+/// 第 3 条：`Tailscale` 档位同时绑 Tailscale IP 与回环。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_tailscale_binds_tailnet_and_loopback() {
+    let port = free_port();
+    let h = start_headless_configured(
+        with_scope(port, BindScope::Tailscale),
+        None,
+        RecordingSink::new(),
+    )
+    .await;
+
+    let loopback_status = reqwest::get(format!("{}/api/health", h.base_url))
+        .await
+        .expect("loopback request")
+        .status()
+        .as_u16();
+    assert_eq!(
+        loopback_status, 200,
+        "Tailscale 档位下 127.0.0.1 必须仍然可用"
+    );
+
+    match super::get_tailscale_ip() {
+        Some(ip) => {
+            let destination: SocketAddr = format!("{ip}:{port}")
+                .parse()
+                .expect("tailscale ip must form a socket address");
+            assert!(
+                h.server
+                    .state
+                    .listeners
+                    .read()
+                    .await
+                    .keys()
+                    .any(|addr| addr.ip().to_string() == ip),
+                "Tailscale 档位必须真的绑上 {ip}，实际监听表：{:?}",
+                h.server
+                    .state
+                    .listeners
+                    .read()
+                    .await
+                    .keys()
+                    .collect::<Vec<_>>()
+            );
+            tcp_connect_from(None, destination)
+                .await
+                .unwrap_or_else(|e| panic!("Tailscale listener {destination} 必须可达：{e}"));
+
+            // 本机连 tailnet 地址时，服务端看到的 peer 是 100.x（非回环），
+            // 所以没有凭据必须 401。
+            let status = reqwest::Client::new()
+                .get(format!("http://{destination}/api/health"))
+                .send()
+                .await
+                .expect("tailnet request")
+                .status()
+                .as_u16();
+            assert_eq!(status, 401, "tailnet 来源未带凭据必须是 401");
+
+            let token = issue_tokens(&h.cfg_dir, &["tailnet-client"]).remove(0);
+            let status = reqwest::Client::new()
+                .get(format!("http://{destination}/api/health"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .expect("authenticated tailnet request")
+                .status()
+                .as_u16();
+            assert_eq!(status, 200, "带凭据的 tailnet 请求必须放行");
+        }
+        None => {
+            // 规格 B 的兜底路径：拿不到 Tailscale IP 时只绑回环并记日志。
+            eprintln!(
+                "NOTE e2e_bind_scope_tailscale_binds_tailnet_and_loopback: \
+                 no Tailscale IP on this machine; verified the documented fallback only"
+            );
+            let listeners = h.server.state.listeners.read().await;
+            assert_eq!(
+                listeners.len(),
+                1,
+                "拿不到 Tailscale IP 时必须退回只有回环一个 listener"
+            );
+            assert!(
+                listeners.keys().all(|addr| addr.ip().is_loopback()),
+                "兜底监听表里不得出现非回环地址"
+            );
+        }
+    }
+
+    teardown(h).await;
+}
+
+/// 第 4 条：放宽必须两段式；确认之后监听地址真的变了。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_widening_requires_confirmation_and_rebinds() {
+    let src = match nonloopback_source().await {
+        Ok(src) => src,
+        Err(why) => {
+            eprintln!("SKIP e2e_bind_scope_widening_requires_confirmation_and_rebinds: {why}");
+            return;
+        }
+    };
+
+    let port = free_port();
+    let h = start_headless_configured(loopback_only(port), None, RecordingSink::new()).await;
+    let tokens = issue_tokens(&h.cfg_dir, &["alice", "bob"]);
+    let (alice, bob) = (&tokens[0], &tokens[1]);
+    let destination = SocketAddr::new(src.ip, port);
+
+    // 基线：LAN 目的地址不可达。
+    assert_connection_refused(src.ip, destination).await;
+
+    // 第一段：申请不生效、不落盘、不改监听。
+    let confirmation_id = request_widening(&h, alice, "allInterfaces").await;
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::Loopback,
+        "申请不得改变生效档位"
+    );
+    assert_connection_refused(src.ip, destination).await;
+    assert!(!h.cfg_dir.join("exposure.json").exists(), "申请不得落盘");
+
+    // 跨会话确认必须被拒（且不消费申请）。
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        bob,
+        serde_json::json!({ "confirmationId": confirmation_id }),
+    )
+    .await;
+    assert_eq!(response.status(), 400, "B 会话不得确认 A 的申请");
+
+    // 第二段：同一会话确认之后才生效。
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        alice,
+        serde_json::json!({ "confirmationId": confirmation_id }),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "同一会话确认必须成功");
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["applied"], serde_json::json!(true));
+    assert_eq!(body["bindScope"], serde_json::json!("allInterfaces"));
+
+    // 配置变了，**监听地址也真的变了**。
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::AllInterfaces
+    );
+    tcp_connect_from_retrying(Some(src.ip), destination).await;
+    assert_eq!(
+        get_status_from_source_retrying(src.ip, destination, "/api/health", None).await,
+        401,
+        "可达之后仍然要求配对凭证"
+    );
+    assert_eq!(
+        get_status_from_source_retrying(src.ip, destination, "/api/health", Some(alice)).await,
+        200
+    );
+
+    // 落盘的是新档位。
+    let persisted: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(h.cfg_dir.join("exposure.json")).expect("exposure.json"),
+    )
+    .expect("exposure.json must be JSON");
+    assert_eq!(persisted["bindScope"], serde_json::json!("allInterfaces"));
+
+    teardown(h).await;
+}
+
+/// 第 5 条：收紧不需要确认，立即生效且监听地址真的变窄。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_narrowing_applies_immediately_and_rebinds() {
+    let src = match nonloopback_source().await {
+        Ok(src) => src,
+        Err(why) => {
+            eprintln!("SKIP e2e_bind_scope_narrowing_applies_immediately_and_rebinds: {why}");
+            return;
+        }
+    };
+
+    let port = free_port();
+    let h = start_headless_configured(
+        with_scope(port, BindScope::AllInterfaces),
+        None,
+        RecordingSink::new(),
+    )
+    .await;
+    let alice = issue_tokens(&h.cfg_dir, &["alice"]).remove(0);
+    let destination = SocketAddr::new(src.ip, port);
+
+    // 起点：LAN 可达。
+    tcp_connect_from_retrying(Some(src.ip), destination).await;
+
+    // 收紧：一次 request 就生效，没有 confirmation id。
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/request",
+        &alice,
+        serde_json::json!({ "scope": "loopback" }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["applied"], serde_json::json!(true), "收紧必须立即生效");
+    assert!(
+        body.get("confirmationId").is_none() || body["confirmationId"].is_null(),
+        "收紧不应返回 confirmation id：{body}"
+    );
+
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::Loopback
+    );
+    assert_connection_refused(src.ip, destination).await;
+    assert_eq!(
+        reqwest::get(format!("{}/api/health", h.base_url))
+            .await
+            .expect("loopback request")
+            .status()
+            .as_u16(),
+        200,
+        "收紧不得弄坏回环"
+    );
+
+    teardown(h).await;
+}
+
+/// 第 6 条：同一个 confirmationId 确认两次，第二次必须拒绝。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_confirmation_id_is_single_use() {
+    let port = free_port();
+    let h = start_headless_configured(loopback_only(port), None, RecordingSink::new()).await;
+    let alice = issue_tokens(&h.cfg_dir, &["alice"]).remove(0);
+    let id = request_widening(&h, &alice, "tailscale").await;
+
+    let first = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        &alice,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(first.status(), 200, "第一次确认必须成功");
+
+    let second = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        &alice,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(second.status(), 400, "同一个 id 第二次确认必须被拒");
+
+    teardown(h).await;
+}
+
+/// 第 7 条：过期后确认被拒。TTL 由测试注入（150ms），不真的 sleep 五分钟。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_expired_confirmation_is_rejected() {
+    let port = free_port();
+    let h = start_headless_configured(
+        loopback_only(port),
+        Some(Duration::from_millis(150)),
+        RecordingSink::new(),
+    )
+    .await;
+    let alice = issue_tokens(&h.cfg_dir, &["alice"]).remove(0);
+    let id = request_widening(&h, &alice, "tailscale").await;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        &alice,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(response.status(), 400, "过期后确认必须被拒");
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::Loopback,
+        "过期申请不得改配置"
+    );
+
+    teardown(h).await;
+}
+
+/// 第 8 条：A 会话申请、B 会话确认 → 拒绝；A 自己仍能确认。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_cross_session_confirmation_is_rejected() {
+    let port = free_port();
+    let h = start_headless_configured(loopback_only(port), None, RecordingSink::new()).await;
+    let tokens = issue_tokens(&h.cfg_dir, &["alice", "bob"]);
+    let (alice, bob) = (&tokens[0], &tokens[1]);
+    let id = request_widening(&h, alice, "tailscale").await;
+
+    let by_bob = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        bob,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(by_bob.status(), 400, "B 会话确认必须被拒");
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::Loopback
+    );
+
+    // B 的失败不得把 A 的申请消费掉。
+    let by_alice = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        alice,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(by_alice.status(), 200, "A 自己仍然可以确认");
+    assert_eq!(
+        h.server.config_snapshot().await.bind_scope,
+        BindScope::Tailscale
+    );
+
+    teardown(h).await;
+}
+
+/// 第 9 条：落盘后重新构造 server，档位仍是刚才设的（启动路径 C.2）。
+#[serial_test::serial]
+#[tokio::test]
+async fn e2e_bind_scope_survives_restart() {
+    let dir = tempfile::tempdir().expect("config dir owned by the test");
+    let port = free_port();
+    let h = start_headless_configured_in(
+        dir.path().to_path_buf(),
+        None,
+        loopback_only(port),
+        None,
+        RecordingSink::new(),
+    )
+    .await;
+    let alice = issue_tokens(&h.cfg_dir, &["alice"]).remove(0);
+    let id = request_widening(&h, &alice, "allInterfaces").await;
+    let response = post_json_with_token(
+        &h.base_url,
+        "/api/remote/config/bind-scope/confirm",
+        &alice,
+        serde_json::json!({ "confirmationId": id }),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    teardown(h).await;
+
+    // 生产启动路径：`lib.rs` 调的就是这个函数。
+    let startup = startup_remote_config(dir.path(), true, port, false);
+    assert_eq!(
+        startup.bind_scope,
+        BindScope::AllInterfaces,
+        "启动时必须从 exposure.json 读回档位，而不是回默认值"
+    );
+
+    // 重新构造 server：生效配置里仍是刚才的档位。
+    let restarted = RemoteServer::new(
+        RemoteApp::headless(),
+        Arc::new(RecordingSink::new()),
+        startup,
+        dir.path().to_path_buf(),
+    )
+    .expect("restart with the same config dir");
+    assert_eq!(
+        restarted.config_snapshot().await.bind_scope,
+        BindScope::AllInterfaces
+    );
 }

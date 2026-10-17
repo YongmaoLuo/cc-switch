@@ -88,6 +88,41 @@ Credentials should flow only between memory and the secure storage described
 above. Logs, error messages and crash reports must not contain the plaintext token
 either.
 
+## Binding Scope and Two-Phase Confirmation
+
+Which addresses the server listens on is decided by a three-tier binding scope
+(listed narrow to wide):
+
+| Tier | Listen addresses | Who can connect |
+|---|---|---|
+| `loopback` | `127.0.0.1:<port>` | this machine only |
+| `tailscale` | `127.0.0.1:<port>` + the Tailscale IP | this machine and the tailnet |
+| `allInterfaces` | `0.0.0.0:<port>` | anything that can reach this machine's LAN / Tailscale address |
+
+**Narrowing** (moving left) applies immediately. **Widening** (moving right) is
+two-phase:
+
+1. `POST /api/remote/config/bind-scope/request` (body `{ "scope": "..." }`) only
+   registers a pending request and returns
+   `{ "confirmationId": "...", "expiresAt": <unix seconds> }`; configuration and
+   listeners do not change;
+2. `POST /api/remote/config/bind-scope/confirm` (body `{ "confirmationId": "..." }`)
+   is what commits, persists and rebinds the listeners.
+   `POST /api/remote/config/bind-scope/reject` cancels a pending request.
+
+All three endpoints are `Protected`: **requests from non-loopback sources still
+require a pairing credential**. A confirmation id is single-use, expires after
+five minutes, and can only be redeemed by **the same authenticated session that
+requested it** (Bearer and cookie are distinct session digests). The server has
+**no** endpoint that directly sets the binding scope.
+
+Honest boundary statement: against a fully compromised, already-paired client,
+two-phase confirmation raises the bar and leaves an audit trail — it is not a
+hard boundary. It stops a single line of renderer code from widening the scope;
+it does not stop an attacker holding a valid credential from walking through both
+steps. The only hard boundary would be "you must go back to that machine and
+click a native dialog", which this design deliberately did not choose.
+
 ## Boundaries
 
 - This document describes what **integrators must do**; it is not a description

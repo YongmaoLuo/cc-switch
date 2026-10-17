@@ -109,6 +109,42 @@ pub enum SessionAudience {
     AnonymousLoopback,
 }
 
+/// 「这一发请求是谁」—— 两段式绑定范围用它把确认绑回发起方。
+///
+/// 三种身份来自三条互相独立的入口：
+///
+/// - [`Self::Credential`]：远程 REST 请求，身份是鉴权中间件验过的那条凭据摘要。
+///   Bearer 与 cookie 各自对应同一条 `ClientToken` 记录上的两个摘要，因此
+///   「用同一个 Bearer 申请、再用同一个 cookie 确认」会被判成**不同**会话 ——
+///   这比按客户端名分组更严，也更符合「同一个已认证会话」的字面意思。
+/// - [`Self::LocalLoopback`]：本机回环、未带凭据的请求（配对前打开的内嵌页面）。
+/// - [`Self::LocalWindow`]：桌面端 Tauri 命令，不经过 HTTP 中间件。
+#[derive(Debug, Clone, Copy)]
+pub enum SessionIdentity {
+    /// 已验过的凭据摘要。
+    Credential(ClientDigest),
+    /// 本机回环匿名请求。
+    LocalLoopback,
+    /// 桌面端进程内的窗口。
+    LocalWindow,
+}
+
+impl SessionIdentity {
+    /// 两个身份是不是同一个会话。
+    ///
+    /// 摘要比较必须走 [`ClientDigest::ct_eq`]（恒时）—— `ClientDigest` 不提供
+    /// `PartialEq`，这里因此故意不派生 `PartialEq` 给整个枚举，避免有人写出
+    /// 一条经由字段短路的 `==`。
+    pub fn same_session(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Credential(a), Self::Credential(b)) => a.ct_eq(b),
+            (Self::LocalLoopback, Self::LocalLoopback) => true,
+            (Self::LocalWindow, Self::LocalWindow) => true,
+            _ => false,
+        }
+    }
+}
+
 impl SessionAudience {
     /// 由「凭据闸门是否真的验过一条凭据」决定档位。
     ///
@@ -194,10 +230,19 @@ fn gate(
     next: Next,
 ) -> AuthFuture {
     Box::pin(async move {
-        match evaluate(scope, &config_dir, &origins, &req) {
+        let (outcome, credential) = evaluate(scope, &config_dir, &origins, &req);
+        match outcome {
             Outcome::Allow(audience) => {
                 // 会话档位随请求往下传：下游 handler 据此选视图，不必重新解析凭据。
                 req.extensions_mut().insert(audience);
+                // 两段式绑定范围要的是「同一个已认证会话」：已验过的凭据摘要
+                // 就是最常见的那种身份；没有凭据而被回环豁免放行的请求归入
+                // `LocalLoopback`，不会与任何远程凭据相等。
+                let identity = match credential {
+                    Some(digest) => SessionIdentity::Credential(digest),
+                    None => SessionIdentity::LocalLoopback,
+                };
+                req.extensions_mut().insert(identity);
                 next.run(req).await
             }
             Outcome::ForbiddenOrigin => forbidden(),
@@ -207,16 +252,23 @@ fn gate(
 }
 
 /// 请求的判定结果。与 [`decide`] 同序：Origin 否决 → 通道归类 → 凭据闸门。
+///
+/// 第二个返回值是「这次放行走的是哪条凭据」：只有凭据闸门真的换出摘要才算
+/// 有身份，其余一律 `None`。
 fn evaluate(
     scope: AuthScope,
     config_dir: &Path,
     origins: &OriginSet,
     req: &Request<Body>,
-) -> Outcome {
+) -> (Outcome, Option<ClientDigest>) {
     // 凭据为零时连文件都不读：本机内嵌页面在配对之前就存在。
     let cred = credential_of(req, scope, config_dir);
+    let credential = match cred {
+        Cred::Session(digest) => Some(digest),
+        _ => None,
+    };
     // 只有凭据闸门真的换出摘要才算「已鉴权」；`Cred::None` 一律匿名。
-    let audience = SessionAudience::from_verified(matches!(cred, Cred::Session(_)));
+    let audience = SessionAudience::from_verified(credential.is_some());
     let decision = decide(
         peer_of(req),
         header_str(req.headers(), header::ORIGIN),
@@ -225,7 +277,7 @@ fn evaluate(
         origins,
     );
 
-    match decision {
+    let outcome = match decision {
         Decision::Deny(DenyReason::ForbiddenOrigin) => Outcome::ForbiddenOrigin,
         // Public 只豁免凭据闸门；Origin 否决在上面已经先行返回。
         Decision::Deny(DenyReason::Unauthorized) if scope.expects_no_credential() => {
@@ -233,7 +285,8 @@ fn evaluate(
         }
         Decision::Deny(DenyReason::Unauthorized) => Outcome::Unauthorized,
         Decision::Allow => Outcome::Allow(audience),
-    }
+    };
+    (outcome, credential)
 }
 
 /// 来源地址归类。拿不到来源就是「不知道是谁来的」，按最严的一侧算。
@@ -565,8 +618,8 @@ mod tests {
         let src = include_str!("../mod.rs");
         assert_eq!(
             ROUTE_SCOPE_TABLE.len(),
-            14,
-            "业务路由表必须是 14 条：13 条 /api/* 加根部 GET /"
+            17,
+            "业务路由表必须是 17 条：16 条 /api/* 加根部 GET /"
         );
         assert_eq!(
             register_call_count(src),
@@ -611,7 +664,7 @@ mod tests {
         }
     }
 
-    /// 表本身的两条不变式：14 条、且每条都有 scope。
+    /// 表本身的两条不变式：17 条、且每条都有 scope。
     #[test]
     fn scope_table_declares_every_route_exactly_once() {
         let paths: Vec<&str> = ROUTE_SCOPE_TABLE.iter().map(|(p, _)| *p).collect();

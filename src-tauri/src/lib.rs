@@ -66,7 +66,7 @@ pub use mcp::{
 };
 pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
-pub use remote::config::{NativeConfirmation, BIND_SCOPE_CONFIRM_EVENT};
+pub use remote::config::startup_remote_config;
 pub use remote::{BindScope, CorsMode, ManagedRemoteServer, RemoteConfig};
 pub use services::{
     profile::{ProfilePayload, ProfileScope, ProfileService},
@@ -1202,14 +1202,17 @@ pub fn run() {
             // 启动 Remote Management HTTP Server
             {
                 let app_settings = crate::settings::get_settings();
-                let remote_config = remote::RemoteConfig {
-                    enabled: app_settings.remote_enabled,
-                    port: app_settings.remote_port,
-                    tailscale_enabled: app_settings.remote_tailscale_enabled,
-                    // 暴露边界不从 settings 进来：绑定范围只经两段式原生确认变更，
-                    // CORS/白名单只经 `set_remote_config` 写进 gate。
-                    ..Default::default()
-                };
+                // 暴露边界的权威存储是 exposure.json：启动时必须读它，否则
+                // 重启会把用户确认过的绑定范围 / CORS / 白名单悄悄抹回默认值。
+                // `startup_remote_config` 同时承担旧设置迁移：老用户只开过
+                // `remote_tailscale_enabled` 时，在文件里没有显式档位的前提下
+                // 按 `Tailscale` 处理。
+                let remote_config = remote::config::startup_remote_config(
+                    &crate::config::get_app_config_dir(),
+                    app_settings.remote_enabled,
+                    app_settings.remote_port,
+                    app_settings.remote_tailscale_enabled,
+                );
 
                 // 注入空的 ManagedRemoteServer，供后续命令使用
                 app.manage(remote::ManagedRemoteServer::new(Arc::new(tokio::sync::RwLock::new(None))));

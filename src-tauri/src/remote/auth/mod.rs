@@ -17,7 +17,7 @@ mod token;
 // 装配层（`remote::mod`）挂在每条路由上的鉴权中间件与 scope 类型。
 // `SessionAudience` 一并外露：它由中间件在 Allow 出口注入请求 extension，
 // handler（如 `/api/events`）据此选视图 —— 凭据只在闸门这一处被解释一次。
-pub use middleware::{auth_layer, AuthScope, SessionAudience};
+pub use middleware::{auth_layer, AuthScope, SessionAudience, SessionIdentity};
 
 // 判定表的消费方（中间件、`remote::mod`）接上来之后仍走各自的模块路径，只有
 // `origin_is_allowed` 经这里被引用；其余名字依旧是「未使用」，豁免保留。

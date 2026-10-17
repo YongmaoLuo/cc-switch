@@ -4,7 +4,7 @@
 //! 直接调用 ProviderService::switch()，确保 backfill 和状态一致性。
 //! 彻底解决独立 Python remote 绕过桌面端状态管理导致的竞态覆盖问题。
 
-mod auth;
+pub(crate) mod auth;
 pub(crate) mod config;
 mod events;
 mod handlers;
@@ -37,16 +37,42 @@ use tower_http::cors::{Any, CorsLayer};
 
 /// 服务绑在哪个范围上。
 ///
-/// 只有两档，**没有**「所有网卡」这个取值：要往外放必须显式选 [`BindScope::Lan`]，
-/// 而那一步本身走两段式确认（见 [`config::BindScopeGate`]）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// 三档，按 **可达面从窄到宽** 排列；`Ord` 的顺序就是「变宽 / 变窄」的判据
+/// （见 [`Self::widens_from`]），所以变体的书写顺序本身是契约的一部分。
+///
+/// 放宽（往更宽的档位走）必须走两段式确认（见 [`config::BindScopeGate`]）；
+/// 收紧随时可做。
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum BindScope {
-    /// 只绑回环地址（本机可达）
+    /// 只绑 `127.0.0.1`（本机可达）
     #[default]
     Loopback,
-    /// 额外绑局域网/tailnet 地址（外部可达）
-    Lan,
+    /// `127.0.0.1` + Tailscale IP（tailnet 内可达，取不到 Tailscale IP 时退回回环）
+    Tailscale,
+    /// `0.0.0.0`（覆盖全部网卡，局域网与 tailnet 都可直接连）
+    AllInterfaces,
+}
+
+impl BindScope {
+    /// `self` 是否比 `current` 更宽。变宽需要第二段确认，变窄立即生效。
+    ///
+    /// 用枚举的 `Ord` 而不是另写一张 `match` 表：多一个变体时 `Ord` 自然把它
+    /// 排进顺序里，而手写的表会静默漏掉新变体。
+    pub fn widens_from(self, current: Self) -> bool {
+        self > current
+    }
 }
 
 /// 跨域策略。取值集合恰为两个，**不存在** `Any` / 通配变体 —— 放宽到任意
@@ -77,9 +103,12 @@ pub struct RemoteConfig {
     pub enabled: bool,
     /// 监听端口
     pub port: u16,
-    /// 是否同时监听 Tailscale IP（远程访问）
+    /// **遗留字段**，不再是绑定的权威源：绑定范围只看 [`Self::bind_scope`]。
+    ///
+    /// 保留它是为了 `start_remote_server` / `restart_remote_server` 的既有实参
+    /// 形状与老 settings.json 的兼容；新代码不得据此决定监听地址。
     pub tailscale_enabled: bool,
-    /// 绑定范围，默认回环。只能经两段式确认变更。
+    /// 绑定范围，默认回环。变宽只能经两段式确认变更。
     pub bind_scope: BindScope,
     /// 跨域策略，默认同源。
     pub cors_mode: CorsMode,
@@ -142,7 +171,7 @@ fn scheme_of(tls: bool) -> &'static str {
 
 /// CORS `Access-Control-Allow-Origin` 的白名单。
 ///
-/// **这是装配层唯一的 origin 来源**：[`RemoteServer::build_router`] 只经它取
+/// **这是装配层唯一的 origin 来源**：[`build_router`] 只经它取
 /// CORS 名单，测试与将来的其它装配点也必须经它 —— 两处各写一份清单，
 /// 漏一条的后果是「内嵌 webview 被浏览器按跨源掐掉」，而这类故障只在
 /// 生产构建里表现为白屏。
@@ -152,8 +181,8 @@ fn scheme_of(tls: bool) -> &'static str {
 /// 1. **本服务自身**（`self_origin`）：服务自己发出去的页面的 origin。
 /// 2. **内嵌 webview**（[`TAURI_WEBVIEW_ORIGINS`] + [`DEV_SERVER_ORIGIN`]）：
 ///    谁在读响应，不受用户配置影响。
-/// 3. **Tailscale origin**：仅当 [`RemoteConfig::tailscale_enabled`]，远程浏览器
-///    打开的正是那个地址。
+/// 3. **Tailscale origin**：仅当 [`RemoteConfig::bind_scope`] 比 [`BindScope::Loopback`]
+///    宽 —— 那两个档位下浏览器可以从 Tailscale 地址打开页面。
 /// 4. **用户白名单**：仅当 [`CorsMode::ExplicitWhitelist`]，逐条过
 ///    [`config::validate_whitelist`] —— 与 `set_cors` 那道闸门**同一份判据**。
 ///
@@ -175,7 +204,7 @@ pub fn allowed_origins(cfg: &RemoteConfig, tls: bool) -> Vec<axum::http::HeaderV
     #[cfg(debug_assertions)]
     origins.push(DEV_SERVER_ORIGIN.to_string());
 
-    if cfg.tailscale_enabled {
+    if cfg.bind_scope != BindScope::Loopback {
         if let Some(ip) = get_tailscale_ip() {
             origins.push(format!("{scheme}://{ip}:{}", cfg.port));
         }
@@ -244,6 +273,10 @@ impl Clone for RemoteApp {
 }
 
 /// Remote server 共享状态
+///
+/// 监听地址表与生效配置挂在 **state** 上而不是 [`RemoteServer`] 上：两段式
+/// 确认的 REST handler 只拿得到 `Arc<RemoteState>`，而「确认之后立刻重绑」
+/// 需要读写这两份东西。server 因此退化成一层很薄的包装。
 pub struct RemoteState {
     /// Tauri AppHandle，用于访问 managed AppState 和刷新托盘。
     /// headless 构造下缺席，此时依赖 GUI 的路由不可用。
@@ -259,6 +292,19 @@ pub struct RemoteState {
     pub config_dir: PathBuf,
     /// 运行状态标志：stop() 后设为 false，拒绝新请求
     pub running: std::sync::atomic::AtomicBool,
+    /// 配对子系统的独立状态：不持有 AppHandle，因此能与 GUI 生命周期脱钩。
+    ///
+    /// 桌面端的审批命令要读写同一个 store（见 `commands::remote`），故对 crate 内
+    /// 可见 —— 与 server 另起一个 store 会让「批了」落不到 HTTP 路由那边。
+    pub(crate) pairing: PairingApiState,
+    /// 对外暴露边界（绑定范围 / CORS / 白名单）。同样对 crate 内可见 —— 桌面端的
+    /// `get/set_remote_config` 与两段式确认读写的是同一个闸门。
+    pub(crate) exposure: config::BindScopeGate,
+    /// 按地址独立管理的 listener：支持动态增删，绑定范围变化时只动变的地址。
+    listeners: RwLock<HashMap<SocketAddr, ListenerEntry>>,
+    /// 当前生效配置。**只有** [`RemoteState::update`] 会写它，且写之前所有
+    /// 新 listener 都已经用新配置装配好了 router。
+    config: RwLock<RemoteConfig>,
 }
 
 struct ListenerEntry {
@@ -267,23 +313,453 @@ struct ListenerEntry {
 }
 
 /// Remote 管理服务器
+///
+/// 薄包装：所有状态都在 [`RemoteState`] 里，见那里的文档。
 pub struct RemoteServer {
     state: Arc<RemoteState>,
-    /// 配对子系统的独立状态：不持有 AppHandle，因此能与 GUI 生命周期脱钩。
-    ///
-    /// 桌面端的审批命令要读写同一个 store（见 `commands::remote`），故对 crate 内
-    /// 可见 —— 与 server 另起一个 store 会让「批了」落不到 HTTP 路由那边。
-    pub(crate) pairing: PairingApiState,
-    /// 对外暴露边界（绑定范围 / CORS / 白名单）。同样对 crate 内可见 —— 桌面端的
-    /// `get/set_remote_config` 与两段式点火读写的是同一个闸门。
-    pub(crate) exposure: config::BindScopeGate,
-    /// 按地址独立管理的 listener：支持动态增删，Tailscale 切换时不中断 localhost
-    listeners: Arc<RwLock<HashMap<SocketAddr, ListenerEntry>>>,
-    config: RwLock<RemoteConfig>,
 }
 
-/// Tauri managed state wrapper
-pub struct ManagedRemoteServer(Arc<RwLock<Option<RemoteServer>>>);
+/// 根据配置计算目标监听地址列表。
+///
+/// 档位与地址的对应关系是产品契约（不是实现细节）：
+///
+/// | `BindScope` | 监听地址 |
+/// |---|---|
+/// | `Loopback` | `127.0.0.1:{port}` |
+/// | `Tailscale` | `127.0.0.1:{port}` + `{tailscale_ip}:{port}` |
+/// | `AllInterfaces` | `0.0.0.0:{port}` |
+///
+/// Tailscale 档位拿不到 Tailscale IP 时退回 loopback 并**记日志**：静默退回
+/// 会让用户以为「已经对 tailnet 开放」，而实际只有一个回环 listener。
+pub(crate) fn compute_target_addrs(config: &RemoteConfig) -> Vec<SocketAddr> {
+    compute_target_addrs_with(config, get_tailscale_ip().as_deref())
+}
+
+/// [`compute_target_addrs`] 的可注入版本：Tailscale IP 由调用方给。
+///
+/// 拆出来是为了让「拿得到 / 拿不到 Tailscale IP」两条分支都能被单元测试覆盖，
+/// 而不必依赖这台机器上 `tailscale ip -4` 的当前输出。
+pub(crate) fn compute_target_addrs_with(
+    config: &RemoteConfig,
+    tailscale_ip: Option<&str>,
+) -> Vec<SocketAddr> {
+    let loopback = SocketAddr::from(([127, 0, 0, 1], config.port));
+
+    match config.bind_scope {
+        BindScope::Loopback => vec![loopback],
+        BindScope::Tailscale => match tailscale_ip {
+            Some(ip) => match format!("{ip}:{}", config.port).parse() {
+                Ok(addr) => vec![loopback, addr],
+                Err(e) => {
+                    log::warn!(
+                        "[Remote] bind scope is Tailscale but {ip:?} is not a usable address \
+                         ({e}); falling back to loopback only"
+                    );
+                    vec![loopback]
+                }
+            },
+            None => {
+                log::warn!(
+                    "[Remote] bind scope is Tailscale but no Tailscale IP is available; \
+                     falling back to loopback only"
+                );
+                vec![loopback]
+            }
+        },
+        BindScope::AllInterfaces => vec![SocketAddr::from(([0, 0, 0, 0], config.port))],
+    }
+}
+
+/// 某个档位会新增的可达地址（供原生弹窗列出「将要对哪些地址开放」）。
+///
+/// 回环地址是每一档都有的，这里省略；`AllInterfaces` 追加一条通配说明 ——
+/// 逐个枚举本机网卡既不完整（网卡随时增减），也会把「全部网卡」说小。
+pub fn reachable_addresses(scope: BindScope, port: u16) -> Vec<String> {
+    match scope {
+        BindScope::Loopback => Vec::new(),
+        BindScope::Tailscale => get_tailscale_ip()
+            .map(|ip| vec![format!("http://{ip}:{port}")])
+            .unwrap_or_else(|| vec!["Tailscale IP unavailable".to_string()]),
+        BindScope::AllInterfaces => {
+            let mut out = vec![format!("0.0.0.0:{port} (all interfaces)")];
+            if let Some(ip) = get_tailscale_ip() {
+                out.push(format!("http://{ip}:{port}"));
+            }
+            out
+        }
+    }
+}
+
+/// 把一个已经摘出 map 的 listener 交给后台收尾。
+///
+/// 发送 shutdown 之后最多等 3 秒；到点直接 abort。调用方（[`RemoteState::update`]）
+/// 必须**不**等待这个任务：更新请求本身可能就跑在这个 listener 上。
+fn retire_listener(addr: SocketAddr, entry: ListenerEntry) {
+    let _ = entry.shutdown_tx.send(());
+    tokio::spawn(async move {
+        let abort_handle = entry.handle.abort_handle();
+        match tokio::time::timeout(std::time::Duration::from_secs(3), entry.handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("[Remote] Listener task on {addr} panicked: {e}"),
+            Err(_) => {
+                log::warn!("[Remote] Listener on {addr} stop timeout, aborting");
+                abort_handle.abort();
+            }
+        }
+        log::info!("[Remote] Stopped listening on {addr}");
+    });
+}
+
+impl RemoteState {
+    /// 当前生效配置的快照。
+    pub(crate) async fn config_snapshot(&self) -> RemoteConfig {
+        self.config.read().await.clone()
+    }
+
+    /// 启动所有配置中的地址（首次启动用）
+    async fn start(self: &Arc<Self>) -> Result<Vec<String>, String> {
+        let config = self.config_snapshot().await;
+        let addrs = compute_target_addrs(&config);
+        let urls = self.start_addrs(addrs, &config).await;
+
+        if urls.is_empty() {
+            return Err("Failed to bind any address".to_string());
+        }
+
+        Ok(urls)
+    }
+
+    /// 增量更新：根据新配置增删 listener，不中断保留的地址。
+    ///
+    /// **顺序是承重的**：新 listener 的 router 必须用 `new_config` 装配（显式传参，
+    /// 见 [`build_router`]），不能让它去读 `self.config` —— 旧顺序先 `start_addrs`
+    /// 再写 `self.config`，导致新地址上的 router 仍然是旧配置（CORS 名单、Origin
+    /// 判据全部滞后一次变更）。这里先停旧地址、再用新配置起新地址、最后提交配置。
+    async fn update(self: &Arc<Self>, new_config: RemoteConfig) -> Result<Vec<String>, String> {
+        let old_config = self.config_snapshot().await;
+        let current_addrs: Vec<SocketAddr> = self.listeners.read().await.keys().cloned().collect();
+        let target_addrs = compute_target_addrs(&new_config);
+
+        let to_stop: Vec<SocketAddr> = current_addrs
+            .iter()
+            .filter(|a| !target_addrs.contains(a))
+            .cloned()
+            .collect();
+        let to_start: Vec<SocketAddr> = target_addrs
+            .iter()
+            .filter(|a| !current_addrs.contains(a))
+            .cloned()
+            .collect();
+
+        // 先摘掉旧 listener，但**不在这里等它们收尾**。
+        //
+        // 这一条是承重的：重绑请求本身就跑在其中一个 listener 上。优雅关闭要等
+        // 现有连接结束，而那发连接正在等本函数返回 —— 互相等待，最后只能靠 3s
+        // 超时 abort 收场（表现为「改一次档位卡三秒」，甚至把响应连根掐掉）。
+        // 所以这里只把 map 摘干净、把 shutdown 发出去，等待与终止交给后台任务。
+        let mut retired: Vec<(SocketAddr, ListenerEntry)> = Vec::new();
+        {
+            let mut listeners = self.listeners.write().await;
+            for addr in &to_stop {
+                if let Some(entry) = listeners.remove(addr) {
+                    retired.push((*addr, entry));
+                }
+            }
+        }
+        for (addr, entry) in retired {
+            retire_listener(addr, entry);
+        }
+
+        // 保留的地址：listener 与 router 都不动。
+        let mut urls: Vec<String> = target_addrs
+            .iter()
+            .filter(|a| current_addrs.contains(a))
+            .map(|a| format!("http://{a}"))
+            .collect();
+
+        // 启动新地址，router 显式用新配置装配。
+        if !to_start.is_empty() {
+            urls.extend(self.start_addrs(to_start.clone(), &new_config).await);
+        }
+
+        // 每个目标地址都必须真的绑上了才提交配置。否则「配置说 0.0.0.0，实际
+        // 一个 listener 都没有」会让下一次重启前的整个窗口内服务静默失联。
+        let missing: Vec<SocketAddr> = {
+            let listeners = self.listeners.read().await;
+            target_addrs
+                .iter()
+                .filter(|addr| !listeners.contains_key(addr))
+                .copied()
+                .collect()
+        };
+        if !missing.is_empty() {
+            log::error!(
+                "[Remote] could not bind target addresses {missing:?}; rolling back to {old_config:?}"
+            );
+            // 撤掉这次新起的 listener（不等收尾，同上）。
+            let mut rolled_back: Vec<(SocketAddr, ListenerEntry)> = Vec::new();
+            {
+                let mut listeners = self.listeners.write().await;
+                for addr in &to_start {
+                    if let Some(entry) = listeners.remove(addr) {
+                        rolled_back.push((*addr, entry));
+                    }
+                }
+            }
+            for (addr, entry) in rolled_back {
+                retire_listener(addr, entry);
+            }
+            // 把旧地址按旧配置起回来。失败也无可奈何，但至少配置没有前进。
+            let restored = self.start_addrs(to_stop, &old_config).await;
+            return Err(format!(
+                "bind scope update could not bind {missing:?}; restored old listeners {restored:?}"
+            ));
+        }
+
+        *self.config.write().await = new_config;
+
+        Ok(urls)
+    }
+
+    /// 把生效的绑定范围改到 `scope` 并**立刻重绑 listener**。
+    ///
+    /// 只应由两段式确认的确认 / 收紧路径调用：闸门负责持久化与鉴权，这里只负责
+    /// 「已经在跑的 listener 跟上」。
+    pub(crate) async fn rebind_bind_scope(
+        self: &Arc<Self>,
+        scope: BindScope,
+    ) -> Result<(), String> {
+        let mut config = self.config_snapshot().await;
+        if config.bind_scope == scope {
+            return Ok(());
+        }
+        config.bind_scope = scope;
+        self.update(config).await.map(|_| ())
+    }
+
+    /// 启动指定地址的 listener（如果已在运行则跳过）。
+    ///
+    /// `cfg` 必须与这批 listener 应生效的配置一致；调用方显式传入而不是在这里
+    /// 读 `self.config`，见 [`RemoteState::update`] 的顺序说明。
+    async fn start_addrs(
+        self: &Arc<Self>,
+        addrs: Vec<SocketAddr>,
+        cfg: &RemoteConfig,
+    ) -> Vec<String> {
+        let app = build_router(self, cfg);
+        let mut started_urls = Vec::new();
+        let mut listeners = self.listeners.write().await;
+
+        for addr in addrs {
+            if listeners.contains_key(&addr) {
+                started_urls.push(format!("http://{addr}"));
+                continue;
+            }
+
+            // 旧 listener 刚被摘掉时端口可能还没释放（收尾在后台）。这里对
+            // `AddrInUse` 做有界重试（10 × 50ms），而不是把一次成功的档位切换
+            // 记成「绑不上」。
+            let bound = {
+                let mut attempt = 0u8;
+                loop {
+                    match tokio::net::TcpListener::bind(addr).await {
+                        Ok(listener) => break Some(listener),
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < 10 => {
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(e) => {
+                            log::warn!("[Remote] Failed to bind {addr}: {e}");
+                            break None;
+                        }
+                    }
+                }
+            };
+
+            match bound {
+                Some(listener) => {
+                    // 端口 0 时内核会分配真实端口，必须以 listener 实际绑定的
+                    // 地址对外报 URL，否则会把 ":0" 泄漏给调用方。
+                    let bound = listener.local_addr().unwrap_or(addr);
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+                    let app_clone = app.clone();
+                    let handle = tokio::spawn(async move {
+                        // `into_make_service_with_connect_info`：配对限流按来源
+                        // peer IP 计，缺了它 handler 拿不到 `ConnectInfo`。
+                        let serve = axum::serve(
+                            listener,
+                            app_clone.into_make_service_with_connect_info::<SocketAddr>(),
+                        );
+                        let graceful = serve.with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        });
+                        if let Err(e) = graceful.await {
+                            log::warn!("[Remote] Server error on {addr}: {e}");
+                        }
+                    });
+
+                    listeners.insert(
+                        addr,
+                        ListenerEntry {
+                            shutdown_tx,
+                            handle,
+                        },
+                    );
+                    started_urls.push(format!("http://{bound}"));
+                    log::info!("[Remote] Listening on {bound}");
+                }
+                None => {}
+            }
+        }
+
+        started_urls
+    }
+
+    /// 停止指定地址的 listener
+    async fn stop_addrs(&self, addrs: Vec<SocketAddr>) {
+        let mut listeners = self.listeners.write().await;
+
+        for addr in addrs {
+            if let Some(entry) = listeners.remove(&addr) {
+                let _ = entry.shutdown_tx.send(());
+                let abort_handle = entry.handle.abort_handle();
+
+                match tokio::time::timeout(std::time::Duration::from_secs(3), entry.handle).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!("[Remote] Listener task on {addr} panicked: {e}"),
+                    Err(_) => {
+                        log::warn!("[Remote] Listener on {addr} stop timeout, aborting");
+                        abort_handle.abort();
+                    }
+                }
+
+                log::info!("[Remote] Stopped listening on {addr}");
+            }
+        }
+    }
+
+    async fn stop(&self) -> Result<(), String> {
+        // 先标记为 stopped，拒绝已建立连接上的新请求
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        log::info!("[Remote] Running flag set to false");
+
+        let addrs: Vec<SocketAddr> = self.listeners.read().await.keys().cloned().collect();
+        self.stop_addrs(addrs).await;
+
+        log::info!("[Remote] Server stopped");
+        Ok(())
+    }
+}
+
+impl RemoteServer {
+    /// 构造 server。
+    ///
+    /// `config_dir` 是凭据落盘目录，必须与 `auth_layer` 读的是同一个：配对在
+    /// 这里签发的摘要，中间件要能在那里读到，反之亦然。传错目录的后果不是
+    /// 「配对不生效」，而是**签发出去一把中间件永远不认的死 token**。
+    ///
+    /// 顺带在这里建 `remote-auth/secret`（0600）：签发摘要要用它，吊销时反查
+    /// 也要用。凭据文件过宽（0644）时这里就报错，远程服务拒绝带着一个别人
+    /// 也读得到的 secret 起来。
+    fn new(
+        app_handle: RemoteApp,
+        sink: Arc<dyn EventSink>,
+        config: RemoteConfig,
+        config_dir: PathBuf,
+    ) -> Result<Self, String> {
+        Self::new_with_exposure(app_handle, sink, config, config_dir, None)
+    }
+
+    /// [`RemoteServer::new`] 的可注入版本：TTL 可缩短（仅测试构建使用）。
+    ///
+    /// 过期验证不能真的 sleep 五分钟 —— 可注入的 TTL 让 E2E 用几百毫秒就能
+    /// 验到同一段判据。生产入口不暴露这个参数。
+    fn new_with_exposure(
+        app_handle: RemoteApp,
+        sink: Arc<dyn EventSink>,
+        config: RemoteConfig,
+        config_dir: PathBuf,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<Self, String> {
+        let (sse_tx, _) = broadcast::channel(16);
+        let secret = auth::load_or_create(&config_dir).map_err(|e| e.to_string())?;
+        let exposure = match ttl {
+            Some(ttl) => config::BindScopeGate::load_with_ttl(config_dir.clone(), ttl),
+            None => config::BindScopeGate::load(config_dir.clone()),
+        };
+
+        let state = Arc::new(RemoteState {
+            sink: sink.clone(),
+            app_handle,
+            sse_tx,
+            config_dir: config_dir.clone(),
+            running: std::sync::atomic::AtomicBool::new(true),
+            // 审批事件与其它前端事件共用同一个出口：桌面端只需订阅一处。
+            pairing: PairingApiState {
+                // 必须与下面 `secret` 是同一把：状态机交给撤销的那份摘要要拿去
+                // `clients.json` 里逐条 `ct_eq` 比对，而那份库正是用这把 secret
+                // 写的。状态机自己另生成一把的话，撤销会受理成功却一条没摘。
+                store: PairingStore::with_secret(secret),
+                sink,
+                config_dir: config_dir.clone(),
+                secret,
+            },
+            exposure,
+            listeners: RwLock::new(HashMap::new()),
+            config: RwLock::new(config),
+        });
+
+        Ok(Self { state })
+    }
+
+    /// 基于给定 TTL 构造 server（仅测试构建）。见 [`Self::new_with_exposure`]。
+    #[cfg(test)]
+    pub(crate) fn new_with_ttl(
+        app_handle: RemoteApp,
+        sink: Arc<dyn EventSink>,
+        config: RemoteConfig,
+        config_dir: PathBuf,
+        ttl: std::time::Duration,
+    ) -> Result<Self, String> {
+        Self::new_with_exposure(app_handle, sink, config, config_dir, Some(ttl))
+    }
+
+    /// 启动所有配置中的地址（首次启动用）
+    async fn start(&self) -> Result<Vec<String>, String> {
+        self.state.start().await
+    }
+
+    /// 增量更新：根据新配置增删 listener，不中断保留的地址
+    async fn update(&self, new_config: RemoteConfig) -> Result<Vec<String>, String> {
+        self.state.update(new_config).await
+    }
+
+    /// 启动指定地址的 listener（如果已在运行则跳过），配置取当前生效值。
+    ///
+    /// 只被 E2E 基座使用：生产启动走 [`RemoteState::start`]，那里地址由
+    /// `compute_target_addrs` 算出。
+    #[cfg(test)]
+    async fn start_addrs(&self, addrs: Vec<SocketAddr>) -> Vec<String> {
+        let cfg = self.state.config_snapshot().await;
+        self.state.start_addrs(addrs, &cfg).await
+    }
+
+    async fn stop(&self) -> Result<(), String> {
+        self.state.stop().await
+    }
+
+    pub(crate) fn state(&self) -> Arc<RemoteState> {
+        self.state.clone()
+    }
+
+    /// 当前生效配置的快照。
+    #[cfg(test)]
+    pub(crate) async fn config_snapshot(&self) -> RemoteConfig {
+        self.state.config_snapshot().await
+    }
+}
 
 /// 业务路由的鉴权分区表：`(路径, 该路径的凭据通道)`。
 ///
@@ -301,7 +777,7 @@ pub struct ManagedRemoteServer(Arc<RwLock<Option<RemoteServer>>>);
 /// 中间件，它只是换了一条凭据通道。
 ///
 /// 配对端点（`/pairing/*`）是「拿到凭据之前」那一方的入口，属于配对子系统
-/// 自带的一次性凭据，不在本表内、也不计入这 14 条。
+/// 自带的一次性凭据，不在本表内、也不计入这 17 条。
 pub const ROUTE_SCOPE_TABLE: &[(&str, AuthScope)] = &[
     ("/", AuthScope::Public),
     ("/api/providers", AuthScope::Protected),
@@ -317,7 +793,22 @@ pub const ROUTE_SCOPE_TABLE: &[(&str, AuthScope)] = &[
     ("/api/proxy/takeover", AuthScope::Protected),
     ("/api/proxy/failover", AuthScope::Protected),
     ("/api/provider/test", AuthScope::Protected),
+    // 两段式绑定范围：申请 / 确认 / 拒绝。三条**全部**是 `Protected` ——
+    // 放开绑定范围的决定权在 Rust 侧，而能申请这件事本身也要求先证明
+    // 「你是谁」（非回环来源必须持有配对凭证）。
+    (
+        "/api/remote/config/bind-scope/request",
+        AuthScope::Protected,
+    ),
+    (
+        "/api/remote/config/bind-scope/confirm",
+        AuthScope::Protected,
+    ),
+    ("/api/remote/config/bind-scope/reject", AuthScope::Protected),
 ];
+
+/// Tauri managed state wrapper
+pub struct ManagedRemoteServer(Arc<RwLock<Option<RemoteServer>>>);
 
 /// 业务路由进入 Router 的**唯一**入口。
 ///
@@ -326,8 +817,8 @@ pub const ROUTE_SCOPE_TABLE: &[(&str, AuthScope)] = &[
 /// `impl AsRef<str>`：动态拼出来的路径在编译期就走不进这个入口。
 ///
 /// `cfg` 与 CORS 装配读的是**同一个值**（[`build_router`] 里那一份），这样中间件
-/// 的 Origin 判据与 `Access-Control-Allow-Origin` 永远同源。少传一个参数就没
-/// 法从这一层保证「同一份配置来源」。
+/// 的 Origin 判据与 `Access-Control-Allow-Origin` 永远同源。少传一个参数就没法
+/// 从这一层保证「同一份配置来源」。
 #[allow(clippy::too_many_arguments)]
 fn register<S>(
     router: Router<S>,
@@ -453,398 +944,216 @@ pub async fn stop_remote(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-impl RemoteServer {
-    /// 构造 server。
-    ///
-    /// `config_dir` 是凭据落盘目录，必须与 `auth_layer` 读的是同一个：配对在
-    /// 这里签发的摘要，中间件要能在那里读到，反之亦然。传错目录的后果不是
-    /// 「配对不生效」，而是**签发出去一把中间件永远不认的死 token**。
-    ///
-    /// 顺带在这里建 `remote-auth/secret`（0600）：签发摘要要用它，吊销时反查
-    /// 也要用。凭据文件过宽（0644）时这里就报错，远程服务拒绝带着一个别人
-    /// 也读得到的 secret 起来。
-    fn new(
-        app_handle: RemoteApp,
-        sink: Arc<dyn EventSink>,
-        config: RemoteConfig,
-        config_dir: PathBuf,
-    ) -> Result<Self, String> {
-        let (sse_tx, _) = broadcast::channel(16);
-        let secret = auth::load_or_create(&config_dir).map_err(|e| e.to_string())?;
+/// 配对路由。状态是 [`PairingApiState`] 而不是 [`RemoteState`] —— 配对是
+/// 「还没拿到凭据的人」走的路，不该经过持有 AppHandle 的那套状态。
+///
+/// 但**闸门照挂不误**：这里与 [`build_router`] 里 17 条业务路由走的是同一个
+/// [`auth_layer`]，scope 取 [`AuthScope::Public`]。scope 决定的是「凭据闸门
+/// 要不要」，不是「Origin 否决要不要」—— [`auth::middleware`] 的判定链把
+/// Origin 否决排在最前，`Public` 只豁免第三段。于是配对端的语义与
+/// `GET /`（同样是 `Public`）逐条对齐：
+///
+/// - `Origin` 在场且不在白名单 → 403（凭据再对也不救）；
+/// - `Origin` 缺失或合法 → 放行，绝不因为「没带凭据」而 401。
+///
+/// 少了这一层，四条 `/pairing/*` 就成了 Origin 白名单上唯一的缺口：任意网页
+/// 能让浏览器带着攻击者的 `Origin` 打 `POST /pairing/request`，而那一条
+/// 路由的作用正是**签发长期凭据**。`cfg` 必须由 [`build_router`] 传进来，
+/// 好让中间件读到的 Origin 名录与 CORS 的 `Access-Control-Allow-Origin`
+/// 仍然同源（同一个 `allowed_origins(&cfg, ..)`）。
+///
+/// 刻意不进 [`register`]：那条入口断言路径已登记在 [`ROUTE_SCOPE_TABLE`]，
+/// 而配对路由不计入那 17 条 —— 这里挂的是同一段中间件，不是同一张分区表。
+fn pairing_router(state: &Arc<RemoteState>, cfg: &RemoteConfig) -> Router<Arc<RemoteState>> {
+    pairing::router(state.pairing.clone())
+        .with_state(state.pairing.clone())
+        .layer(auth_layer(AuthScope::Public, state.config_dir.clone(), cfg))
+}
 
-        let state = Arc::new(RemoteState {
-            sink,
-            app_handle,
-            sse_tx,
-            config_dir: config_dir.clone(),
-            running: std::sync::atomic::AtomicBool::new(true),
-        });
+/// 业务路由的唯一装配点。
+///
+/// `cfg` 是**显式参数**，不读 `state.config`：增量更新时新 listener 必须用
+/// 新配置装配 router，而 `state.config` 在启动成功之前仍是旧值。读旧值的后果
+/// 是 CORS 白名单与 Origin 判据永远滞后一次变更。
+fn build_router(state: &Arc<RemoteState>, cfg: &RemoteConfig) -> Router {
+    // Origin 白名单只有一份来源：`allowed_origins` 按 `RemoteConfig` 算。
+    // 这里若自己另列一份，中间件那边就永远漏掉其中几条 —— 两份清单各自
+    // 漂移，而症状是「内嵌 webview 被浏览器按跨源掐掉」，只在生产构建里
+    // 表现为白屏。
+    let origins = allowed_origins(cfg, REMOTE_LISTENER_IS_TLS);
 
-        Ok(Self {
-            // 审批事件与其它前端事件共用同一个出口：桌面端只需订阅一处。
-            pairing: PairingApiState {
-                // 必须与下面 `secret` 是同一把：状态机交给撤销的那份摘要要拿去
-                // `clients.json` 里逐条 `ct_eq` 比对，而那份库正是用这把 secret
-                // 写的。状态机自己另生成一把的话，撤销会受理成功却一条没摘。
-                store: PairingStore::with_secret(secret),
-                sink: state.sink.clone(),
-                config_dir: config_dir.clone(),
-                secret,
-            },
-            state,
-            exposure: config::BindScopeGate::load(config_dir.clone()),
-            listeners: Arc::new(RwLock::new(HashMap::new())),
-            config: RwLock::new(config),
-        })
-    }
+    let cors = CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
-    /// 根据配置计算目标监听地址列表
-    fn compute_target_addrs(config: &RemoteConfig) -> Vec<SocketAddr> {
-        let mut addrs = Vec::new();
+    // 业务路由只能经受控的 register() 进入 Router：路径与 scope 一并
+    // 声明在本函数里，鉴权中间件由 register 挂在每条路由上。
+    let mut router: Router<Arc<RemoteState>> = Router::new();
+    router = register(
+        router,
+        "/",
+        Method::GET,
+        AuthScope::Public,
+        axum::routing::get(handlers::index),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/providers",
+        Method::GET,
+        AuthScope::Protected,
+        axum::routing::get(handlers::get_providers),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/usage",
+        Method::GET,
+        AuthScope::Protected,
+        axum::routing::get(handlers::get_usage),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/switch",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::switch_provider),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/reorder",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::reorder_providers),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/current",
+        Method::GET,
+        AuthScope::Protected,
+        axum::routing::get(handlers::get_current),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/events",
+        Method::GET,
+        AuthScope::BrowserSafe,
+        axum::routing::get(handlers::sse_events),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/health",
+        Method::GET,
+        AuthScope::Protected,
+        axum::routing::get(handlers::health_check),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/icon",
+        Method::GET,
+        AuthScope::BrowserSafe,
+        axum::routing::get(handlers::get_icon),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/provider-icons/:name",
+        Method::GET,
+        AuthScope::BrowserSafe,
+        axum::routing::get(handlers::get_provider_icon),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/proxy/control",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::proxy_control),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/proxy/takeover",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::proxy_takeover),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/proxy/failover",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::proxy_failover),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/provider/test",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::test_provider),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    // 两段式绑定范围的三条路由。全部 `Protected`：非回环来源必须持有配对
+    // 凭证才摸得到，而它们只负责「申请 / 确认 / 拒绝」，没有任何一条能直接
+    // 接受一个档位并落盘。
+    router = register(
+        router,
+        "/api/remote/config/bind-scope/request",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::request_bind_scope),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/remote/config/bind-scope/confirm",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::confirm_bind_scope),
+        state.config_dir.as_path(),
+        cfg,
+    );
+    router = register(
+        router,
+        "/api/remote/config/bind-scope/reject",
+        Method::POST,
+        AuthScope::Protected,
+        axum::routing::post(handlers::reject_bind_scope),
+        state.config_dir.as_path(),
+        cfg,
+    );
 
-        // 始终包含 localhost
-        if let Ok(addr) = format!("127.0.0.1:{}", config.port).parse() {
-            addrs.push(addr);
-        }
-
-        // 可选：添加 Tailscale IP
-        if config.tailscale_enabled {
-            if let Some(ts_ip) = get_tailscale_ip() {
-                if let Ok(addr) = format!("{}:{}", ts_ip, config.port).parse() {
-                    addrs.push(addr);
-                }
-            }
-        }
-
-        addrs
-    }
-
-    /// 启动指定地址的 listener（如果已在运行则跳过）
-    async fn start_addrs(&self, addrs: Vec<SocketAddr>) -> Vec<String> {
-        let app = self.build_router();
-        let mut started_urls = Vec::new();
-        let mut listeners = self.listeners.write().await;
-
-        for addr in addrs {
-            if listeners.contains_key(&addr) {
-                started_urls.push(format!("http://{addr}"));
-                continue;
-            }
-
-            match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    // 端口 0 时内核会分配真实端口，必须以 listener 实际绑定的
-                    // 地址对外报 URL，否则会把 ":0" 泄漏给调用方。
-                    let bound = listener.local_addr().unwrap_or(addr);
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-                    let app_clone = app.clone();
-                    let handle = tokio::spawn(async move {
-                        // `into_make_service_with_connect_info`：配对限流按来源
-                        // peer IP 计，缺了它 handler 拿不到 `ConnectInfo`。
-                        let serve = axum::serve(
-                            listener,
-                            app_clone.into_make_service_with_connect_info::<SocketAddr>(),
-                        );
-                        let graceful = serve.with_graceful_shutdown(async move {
-                            let _ = shutdown_rx.await;
-                        });
-                        if let Err(e) = graceful.await {
-                            log::warn!("[Remote] Server error on {addr}: {e}");
-                        }
-                    });
-
-                    listeners.insert(
-                        addr,
-                        ListenerEntry {
-                            shutdown_tx,
-                            handle,
-                        },
-                    );
-                    started_urls.push(format!("http://{bound}"));
-                    log::info!("[Remote] Listening on {bound}");
-                }
-                Err(e) => {
-                    log::warn!("[Remote] Failed to bind {addr}: {e}");
-                }
-            }
-        }
-
-        started_urls
-    }
-
-    /// 停止指定地址的 listener
-    async fn stop_addrs(&self, addrs: Vec<SocketAddr>) {
-        let mut listeners = self.listeners.write().await;
-
-        for addr in addrs {
-            if let Some(entry) = listeners.remove(&addr) {
-                let _ = entry.shutdown_tx.send(());
-                let abort_handle = entry.handle.abort_handle();
-
-                match tokio::time::timeout(std::time::Duration::from_secs(3), entry.handle).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::warn!("[Remote] Listener task on {addr} panicked: {e}"),
-                    Err(_) => {
-                        log::warn!("[Remote] Listener on {addr} stop timeout, aborting");
-                        abort_handle.abort();
-                    }
-                }
-
-                log::info!("[Remote] Stopped listening on {addr}");
-            }
-        }
-    }
-
-    /// 启动所有配置中的地址（首次启动用）
-    async fn start(&self) -> Result<Vec<String>, String> {
-        let config = self.config.read().await.clone();
-        let addrs = Self::compute_target_addrs(&config);
-        let urls = self.start_addrs(addrs).await;
-
-        if urls.is_empty() {
-            return Err("Failed to bind any address".to_string());
-        }
-
-        Ok(urls)
-    }
-
-    /// 增量更新：根据新配置增删 listener，不中断保留的地址
-    async fn update(&self, new_config: RemoteConfig) -> Result<Vec<String>, String> {
-        let current_addrs: Vec<SocketAddr> = self.listeners.read().await.keys().cloned().collect();
-        let target_addrs = Self::compute_target_addrs(&new_config);
-
-        // 停止不再需要的地址
-        let to_stop: Vec<SocketAddr> = current_addrs
-            .iter()
-            .filter(|a| !target_addrs.contains(a))
-            .cloned()
-            .collect();
-        if !to_stop.is_empty() {
-            self.stop_addrs(to_stop).await;
-        }
-
-        // 启动新地址
-        let to_start: Vec<SocketAddr> = target_addrs
-            .iter()
-            .filter(|a| !current_addrs.contains(a))
-            .cloned()
-            .collect();
-        let urls: Vec<String> = target_addrs.iter().map(|a| format!("http://{a}")).collect();
-
-        if !to_start.is_empty() {
-            self.start_addrs(to_start).await;
-        }
-
-        // 更新配置
-        *self.config.write().await = new_config;
-
-        Ok(urls)
-    }
-
-    async fn stop(&self) -> Result<(), String> {
-        // 先标记为 stopped，拒绝已建立连接上的新请求
-        self.state
-            .running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        log::info!("[Remote] Running flag set to false");
-
-        let addrs: Vec<SocketAddr> = self.listeners.read().await.keys().cloned().collect();
-        self.stop_addrs(addrs).await;
-
-        log::info!("[Remote] Server stopped");
-        Ok(())
-    }
-
-    fn state(&self) -> Arc<RemoteState> {
-        self.state.clone()
-    }
-
-    /// 配对路由。状态是 [`PairingApiState`] 而不是 [`RemoteState`] —— 配对是
-    /// 「还没拿到凭据的人」走的路，不该经过持有 AppHandle 的那套状态。
-    ///
-    /// 但**闸门照挂不误**：这里与 [`build_router`] 里 14 条业务路由走的是同一个
-    /// [`auth_layer`]，scope 取 [`AuthScope::Public`]。scope 决定的是「凭据闸门
-    /// 要不要」，不是「Origin 否决要不要」—— [`auth::middleware`] 的判定链把
-    /// Origin 否决排在最前，`Public` 只豁免第三段。于是配对端的语义与
-    /// `GET /`（同样是 `Public`）逐条对齐：
-    ///
-    /// - `Origin` 在场且不在白名单 → 403（凭据再对也不救）；
-    /// - `Origin` 缺失或合法 → 放行，绝不因为「没带凭据」而 401。
-    ///
-    /// 少了这一层，四条 `/pairing/*` 就成了 Origin 白名单上唯一的缺口：任意网页
-    /// 能让浏览器带着攻击者的 `Origin` 打 `POST /pairing/request`，而那一条
-    /// 路由的作用正是**签发长期凭据**。`cfg` 必须由 [`build_router`] 传进来，
-    /// 好让中间件读到的 Origin 名录与 CORS 的 `Access-Control-Allow-Origin`
-    /// 仍然同源（同一个 `allowed_origins(&cfg, ..)`）。
-    ///
-    /// 刻意不进 [`register`]：那条入口断言路径已登记在 [`ROUTE_SCOPE_TABLE`]，
-    /// 而配对路由不计入那 14 条 —— 这里挂的是同一段中间件，不是同一张分区表。
-    fn pairing_router(&self, cfg: &RemoteConfig) -> Router<Arc<RemoteState>> {
-        pairing::router(self.pairing.clone())
-            .with_state(self.pairing.clone())
-            .layer(auth_layer(
-                AuthScope::Public,
-                self.state.config_dir.clone(),
-                cfg,
-            ))
-    }
-
-    fn build_router(&self) -> Router {
-        // Origin 白名单只有一份来源：`allowed_origins` 按 `RemoteConfig` 算。
-        // 这里若自己另列一份，中间件那边就永远漏掉其中几条 —— 两份清单各自
-        // 漂移，而症状是「内嵌 webview 被浏览器按跨源掐掉」，只在生产构建里
-        // 表现为白屏。读不到配置时退回默认配置（收紧的一档），绝不放宽。
-        let cfg = self
-            .config
-            .try_read()
-            .map(|c| c.clone())
-            .unwrap_or_default();
-        let origins = allowed_origins(&cfg, REMOTE_LISTENER_IS_TLS);
-
-        let cors = CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods(Any)
-            .allow_headers(Any);
-
-        // 业务路由只能经受控的 register() 进入 Router：路径与 scope 一并
-        // 声明在本函数里，鉴权中间件由 register 挂在每条路由上。
-        let mut router: Router<Arc<RemoteState>> = Router::new();
-        router = register(
-            router,
-            "/",
-            Method::GET,
-            AuthScope::Public,
-            axum::routing::get(handlers::index),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/providers",
-            Method::GET,
-            AuthScope::Protected,
-            axum::routing::get(handlers::get_providers),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/usage",
-            Method::GET,
-            AuthScope::Protected,
-            axum::routing::get(handlers::get_usage),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/switch",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::switch_provider),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/reorder",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::reorder_providers),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/current",
-            Method::GET,
-            AuthScope::Protected,
-            axum::routing::get(handlers::get_current),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/events",
-            Method::GET,
-            AuthScope::BrowserSafe,
-            axum::routing::get(handlers::sse_events),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/health",
-            Method::GET,
-            AuthScope::Protected,
-            axum::routing::get(handlers::health_check),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/icon",
-            Method::GET,
-            AuthScope::BrowserSafe,
-            axum::routing::get(handlers::get_icon),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/provider-icons/:name",
-            Method::GET,
-            AuthScope::BrowserSafe,
-            axum::routing::get(handlers::get_provider_icon),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/proxy/control",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::proxy_control),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/proxy/takeover",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::proxy_takeover),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/proxy/failover",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::proxy_failover),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-        router = register(
-            router,
-            "/api/provider/test",
-            Method::POST,
-            AuthScope::Protected,
-            axum::routing::post(handlers::test_provider),
-            self.state.config_dir.as_path(),
-            &cfg,
-        );
-
-        // 配对是「还没拿到凭据」一方唯一的入口，走配对子系统自带的一次性凭据，
-        // 不在本表内、不计入 14 条业务路由 —— 但 Origin 白名单与业务路由共用同一段
-        // 中间件（见 `pairing_router`），白名单外的 Origin 一律 403。
-        router
-            .merge(self.pairing_router(&cfg))
-            .layer(cors)
-            .with_state(self.state.clone())
-    }
+    // 配对是「还没拿到凭据」一方唯一的入口，走配对子系统自带的一次性凭据，
+    // 不在本表内、不计入 17 条业务路由 —— 但 Origin 白名单与业务路由共用同一段
+    // 中间件（见 `pairing_router`），白名单外的 Origin 一律 403。
+    router
+        .merge(pairing_router(state, cfg))
+        .layer(cors)
+        .with_state(state.clone())
 }
 
 /// App 内切换 provider 后，直接广播 SSE 给所有已连接的远程浏览器（App → Web 方向）。
@@ -910,6 +1219,48 @@ pub async fn broadcast_provider_switch(
 mod tests {
     use super::auth::origin_is_allowed;
     use super::{allowed_origins, CorsMode, RemoteConfig};
+
+    /// 三档位到监听地址的映射（规格 B），含 Tailscale 拿不到 IP 的兜底。
+    #[test]
+    fn compute_target_addrs_follows_the_tier_and_falls_back_without_tailscale() {
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 4567));
+        let tailscale = std::net::SocketAddr::from(([203, 0, 113, 9], 4567));
+        let all = std::net::SocketAddr::from(([0, 0, 0, 0], 4567));
+
+        let mut cfg = super::RemoteConfig {
+            port: 4567,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::compute_target_addrs_with(&cfg, Some("203.0.113.9")),
+            vec![loopback],
+            "Loopback 只绑回环"
+        );
+
+        cfg.bind_scope = super::BindScope::Tailscale;
+        assert_eq!(
+            super::compute_target_addrs_with(&cfg, Some("203.0.113.9")),
+            vec![loopback, tailscale],
+            "Tailscale = 回环 + Tailscale IP"
+        );
+        assert_eq!(
+            super::compute_target_addrs_with(&cfg, None),
+            vec![loopback],
+            "拿不到 Tailscale IP 时退回回环，而不是什么都不绑"
+        );
+        assert_eq!(
+            super::compute_target_addrs_with(&cfg, Some("not-an-ip")),
+            vec![loopback],
+            "Tailscale IP 解析失败同样退回回环"
+        );
+
+        cfg.bind_scope = super::BindScope::AllInterfaces;
+        assert_eq!(
+            super::compute_target_addrs_with(&cfg, Some("203.0.113.9")),
+            vec![all],
+            "AllInterfaces 只绑 0.0.0.0（它覆盖回环）"
+        );
+    }
 
     /// 剥掉行尾注释（区分字符串字面量），让断言读的是代码而不是说明。
     fn strip_comments(src: &str) -> String {

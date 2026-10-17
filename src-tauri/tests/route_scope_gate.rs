@@ -55,8 +55,11 @@ const REMOTE_MOD_RS: &str = "src/remote/mod.rs";
 /// read as green.
 const SCAN_SURFACE: [&str; 1] = [REMOTE_MOD_RS];
 
-/// The route count the table must carry: 14 business routes, none added.
-const EXPECTED_ROUTES: usize = 14;
+/// The route count the table must carry: 17 business routes, none added.
+///
+/// 14 pre-existing routes + the three two-phase bind-scope endpoints
+/// (request / confirm / reject), all `Protected`.
+const EXPECTED_ROUTES: usize = 17;
 
 /// Label for an entry whose scope token this gate does not recognise.
 const UNCLASSIFIED: &str = "UNCLASSIFIED";

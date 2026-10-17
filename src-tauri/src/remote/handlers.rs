@@ -1,9 +1,9 @@
 //! Axum handlers for the remote management API
 
-use super::auth::SessionAudience;
+use super::auth::{SessionAudience, SessionIdentity};
 use super::html::REMOTE_HTML;
 use super::redact;
-use super::RemoteState;
+use super::{BindScope, RemoteState};
 use crate::app_config::AppType;
 use crate::commands::xai_oauth::XaiOAuthState;
 use crate::commands::{self, CopilotAuthState};
@@ -1249,6 +1249,210 @@ pub async fn test_provider(
 /// rejection 在进入函数体前发生），因此单靠它们锁不住 handler 的签名。缺口由
 /// `proxy_control_takes_required_json_body` 用编译期断言补上：把 body 参数改回
 /// `Option<Json<ProxyControlRequest>>` 会让断言无法编译，整套测试直接构建失败。
+// ===========================================================================
+// 两段式绑定范围（REST）
+// ===========================================================================
+//
+// 浏览器不是「特等公民」的例外：这三条与桌面端的 `request_bind_scope_change`
+// 走**同一个** `BindScopeGate`，只是第二段的载体不同（HTTP 确认 vs 原生弹窗）。
+//
+// 网络可达入口的安全边界，再说一遍：
+//
+// - 三条路由都是 `AuthScope::Protected`：非回环来源必须持有配对凭证。
+//   本功能不改既有鉴权模型。
+// - 这里**没有**「直接设一个档位」的端点。宽窄判定在 gate 里：收紧立即生效，
+//   放宽只能返回一个待确认 id。
+// - 对「已被完全攻陷、且已配对的客户端」，两段式是提高门槛 + 留痕，不是硬边界。
+//   硬边界只有「必须回到那台机器上点原生弹窗」，本设计选择允许浏览器内完成，
+//   因此不能声称自己防得住一切。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BindScopeRequestBody {
+    /// 目标档位。**注意**：这不是一个直接 setter —— 是否生效由 gate 的宽窄
+    /// 判定决定。
+    pub scope: BindScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BindScopeConfirmationBody {
+    pub confirmation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindScopeResponse {
+    /// 这次调用结束时目标档位是否已经生效。
+    pub applied: bool,
+    /// 调用结束时**生效中**的档位（待确认时仍是旧值）。
+    pub bind_scope: BindScope,
+    /// 仅放宽申请返回：第二段的凭据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmation_id: Option<String>,
+    /// 仅放宽申请返回：Unix 秒。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl BindScopeResponse {
+    fn applied_now(bind_scope: BindScope) -> Self {
+        Self {
+            applied: true,
+            bind_scope,
+            confirmation_id: None,
+            expires_at: None,
+        }
+    }
+}
+
+/// 取中间件注入的会话身份。
+///
+/// `Protected` 路由的 `Allow` 出口一定会注入；拿不到说明装配层被改坏了 ——
+/// 此时**不能**退回一个默认身份（那会让任意请求都能充当某个会话），必须拒绝。
+fn session_identity(
+    identity: Option<Extension<SessionIdentity>>,
+) -> Result<SessionIdentity, axum::response::Response> {
+    identity.map(|Extension(identity)| identity).ok_or_else(|| {
+        remote_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "missing session identity on a protected route",
+        )
+    })
+}
+
+/// 落盘之后、返回之前：让正在跑的 listener 立刻跟上新档位。
+///
+/// 失败只可能是 bind 失败（比如 Tailscale IP 没了）。此时文件已经是新档位，
+/// 下次启动仍会按它来；本次返回 500 让调用方知道「现在还没生效」。
+async fn rebind_or_500(
+    state: &Arc<RemoteState>,
+    scope: BindScope,
+) -> Result<(), axum::response::Response> {
+    state.rebind_bind_scope(scope).await.map_err(|e| {
+        remote_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bind scope persisted but listeners could not follow: {e}"),
+        )
+    })
+}
+
+/// POST /api/remote/config/bind-scope/request
+///
+/// 收紧 → `{ applied: true, bindScope: … }`；
+/// 放宽 → `{ applied: false, bindScope: <当前>, confirmationId, expiresAt }`。
+pub async fn request_bind_scope(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    identity: Option<Extension<SessionIdentity>>,
+    Json(body): Json<BindScopeRequestBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if !state.running.load(Ordering::SeqCst) {
+        return remote_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Server is stopped",
+        );
+    }
+    let identity = match session_identity(identity) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    match state
+        .exposure
+        .request_bind_scope_change(body.scope, identity)
+    {
+        Ok(super::config::BindScopeRequest::Applied(scope)) => {
+            if let Err(response) = rebind_or_500(&state, scope).await {
+                return response;
+            }
+            Json(BindScopeResponse::applied_now(scope)).into_response()
+        }
+        Ok(super::config::BindScopeRequest::Pending {
+            confirmation_id,
+            expires_at_unix,
+        }) => {
+            let current = state
+                .exposure
+                .overlay(&state.config_snapshot().await)
+                .bind_scope;
+            Json(BindScopeResponse {
+                applied: false,
+                bind_scope: current,
+                confirmation_id: Some(confirmation_id),
+                expires_at: Some(expires_at_unix),
+            })
+            .into_response()
+        }
+        Err(e) => remote_error(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /api/remote/config/bind-scope/confirm
+pub async fn confirm_bind_scope(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    identity: Option<Extension<SessionIdentity>>,
+    Json(body): Json<BindScopeConfirmationBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if !state.running.load(Ordering::SeqCst) {
+        return remote_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Server is stopped",
+        );
+    }
+    let identity = match session_identity(identity) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    match state.exposure.confirm_bind_scope_change(
+        &body.confirmation_id,
+        identity,
+        std::time::Instant::now(),
+    ) {
+        Ok(scope) => {
+            if let Err(response) = rebind_or_500(&state, scope).await {
+                return response;
+            }
+            log::info!("[Remote] bind scope confirmed over REST: {scope:?}");
+            Json(BindScopeResponse::applied_now(scope)).into_response()
+        }
+        Err(e) => remote_error(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// POST /api/remote/config/bind-scope/reject
+pub async fn reject_bind_scope(
+    AxumState(state): AxumState<Arc<RemoteState>>,
+    identity: Option<Extension<SessionIdentity>>,
+    Json(body): Json<BindScopeConfirmationBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if !state.running.load(Ordering::SeqCst) {
+        return remote_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Server is stopped",
+        );
+    }
+    let identity = match session_identity(identity) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+
+    match state.exposure.reject_bind_scope_change(
+        &body.confirmation_id,
+        identity,
+        std::time::Instant::now(),
+    ) {
+        Ok(()) => Json(json!({ "rejected": true })).into_response(),
+        Err(e) => remote_error(axum::http::StatusCode::BAD_REQUEST, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{project_frame, proxy_control, ProxyControlRequest, RemoteState};
