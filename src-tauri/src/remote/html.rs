@@ -492,6 +492,10 @@ function connectSSE() {
                 // /api/reorder 改的是 sort_index：卡片顺序只存在于列表本身，
                 // 不重新拉一遍的话页面会继续按旧顺序显示。
                 loadProviders();
+            } else if (data.type === 'failover_changed') {
+                // 故障转移开关决定「路由目标按队列还是按手动」：P1/P2 徽章
+                // 与开关状态都在这份列表里，不重拉就一直是旧目标。
+                loadProviders();
             } else if (data.type === 'shutdown') {
                 es.close();
                 document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;padding:20px;font-size:18px;color:var(--muted-fg);text-align:center;">Remote server stopped.<br>Please reopen from CC Switch.</div>';

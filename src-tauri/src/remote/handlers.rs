@@ -274,6 +274,19 @@ pub async fn switch_provider(
 
     let app_state = app_state(&state);
 
+    // 故障转移开启时供应商由队列推进，手动切换会把队列的 P1 顶掉。拒绝必须
+    // **零副作用**：不广播、不 notify、不刷新托盘 —— 否则 UI 会以为切换发生过。
+    let (_, auto_failover) = app_state
+        .inner()
+        .db
+        .get_proxy_flags_sync(REMOTE_APP.as_str());
+    if auto_failover {
+        return remote_error(
+            axum::http::StatusCode::OK,
+            "故障转移已开启，无法手动切换供应商；请先关闭故障转移",
+        );
+    }
+
     // 核心：通过 ProviderService::switch() 切换，确保 backfill 正确
     match ProviderService::switch(app_state.inner(), REMOTE_APP, &body.provider_id) {
         Ok(result) => {
@@ -499,9 +512,10 @@ pub async fn sse_events(
 
 /// 广播帧里**携带 provider 细节**、因而必须向匿名调用方降级的帧类型白名单。
 ///
-/// `switch` 带 `provider_id` / `name`，`reorder` 带 `moved_id` —— 两者都是供应商
-/// 拓扑，匿名流只保留「发生过这件事」。
-const DEGRADED_FRAME_TYPES: &[&str] = &["switch", "reorder"];
+/// `switch` 带 `provider_id` / `name`，`reorder` 带 `moved_id`，
+/// `failover_changed` 带 `app_type` / `enabled` —— 三者都是供应商拓扑，
+/// 匿名流只保留「发生过这件事」。
+const DEGRADED_FRAME_TYPES: &[&str] = &["switch", "reorder", "failover_changed"];
 
 /// 把一帧广播载荷投影成 SSE 事件文本；`None` = 这一帧不下发（**不得**因此断流）。
 ///
@@ -510,9 +524,10 @@ const DEGRADED_FRAME_TYPES: &[&str] = &["switch", "reorder"];
 ///
 /// - [`SessionAudience::Authenticated`]：逐字透传，一个字节都不动。
 /// - [`SessionAudience::AnonymousLoopback`]：命中 [`DEGRADED_FRAME_TYPES`] 的帧
-///   （`switch` / `reorder`）按**白名单**重建为 `{"type":<type>,"degraded":true}`
-///   —— 只留类型与降级标记，`provider_id` / `name` / `moved_id` / `position` 等
-///   一切供应商细节都不得出现；其余帧类型（`shutdown` 等）原样下发。
+///   （`switch` / `reorder` / `failover_changed`）按**白名单**重建为
+///   `{"type":<type>,"degraded":true}` —— 只留类型与降级标记，`provider_id` /
+///   `name` / `moved_id` / `position` / `app_type` / `enabled` 等一切供应商细节
+///   都不得出现；其余帧类型（`shutdown` 等）原样下发。
 ///
 /// 为什么按白名单重建而不是逐个 `remove`：移除清单是**枚举**的，新加一个
 /// `provider_xxx` 字段就会从清单漏出去；白名单是**封闭**的，漏不出去。
@@ -966,6 +981,21 @@ pub async fn proxy_failover(
             crate::remote::broadcast_provider_switch(&app_clone, &app_type, &p1_id).await;
         });
     }
+
+    // 无论开启还是关闭都广播：UI 上这个开关决定「路由目标按队列还是按手动」，
+    // 不发这一帧，前端就会一直沿用旧的目标列表（切走再回来才刷新）。
+    // 放在 P1 切换之后，确保订阅方读到的已经是最终状态。
+    let failover_frame = json!({
+        "type": "failover_changed",
+        "app_type": &body.app_type,
+        "enabled": body.enabled,
+    });
+    let _ = state.sse_tx.send(failover_frame.to_string());
+    log::info!(
+        "[Remote] Broadcast failover_changed: {} enabled={}",
+        body.app_type,
+        body.enabled
+    );
 
     // 刷新托盘菜单
     if let Ok(new_menu) = crate::tray::create_tray_menu(app, app_state.inner()) {
@@ -1612,6 +1642,52 @@ mod tests {
             project_frame(raw, SessionAudience::Authenticated),
             Some(raw.to_string()),
             "已鉴权连接的 reorder 帧必须逐字透传"
+        );
+    }
+
+    /// 匿名档：`failover_changed` 帧同样必须被降级。
+    ///
+    /// 这一帧带 `app_type` / `enabled` —— 前者是供应商拓扑所在的维度，
+    /// 后者是这个应用当前的调度语义。降级后只保留「开关变过」这件事本身，
+    /// 前端据此失效缓存并不需要这两个字段。
+    #[test]
+    fn project_frame_strips_failover_details_for_anonymous() {
+        let raw = r#"{"type":"failover_changed","app_type":"claude","enabled":true}"#;
+        let projected = project_frame(raw, SessionAudience::AnonymousLoopback)
+            .expect("failover_changed 帧必须仍被下发 —— 降级不是静默丢帧");
+        let parsed: serde_json::Value = serde_json::from_str(&projected)
+            .unwrap_or_else(|e| panic!("降级帧必须是合法 JSON（{projected:?}）：{e}"));
+
+        assert_eq!(
+            parsed["type"], "failover_changed",
+            "type 必须保留，前端据此失效缓存"
+        );
+        assert_eq!(
+            parsed["degraded"], true,
+            "降级标记必须显式带上，否则前端无法区分「降级」与「无事件」"
+        );
+        assert!(
+            parsed.get("app_type").is_none(),
+            "匿名流里不得出现 app_type（实际 {parsed}）"
+        );
+        assert!(
+            parsed.get("enabled").is_none(),
+            "匿名流里不得出现 enabled（实际 {parsed}）"
+        );
+        assert!(
+            !projected.contains("claude"),
+            "app_type 的字面量连文本都不得残留：{projected}"
+        );
+    }
+
+    /// 已鉴权档：`failover_changed` 帧必须逐字透传。
+    #[test]
+    fn project_frame_passes_authenticated_failover_frames_through_verbatim() {
+        let raw = r#"{"type":"failover_changed","app_type":"claude","enabled":false}"#;
+        assert_eq!(
+            project_frame(raw, SessionAudience::Authenticated),
+            Some(raw.to_string()),
+            "已鉴权连接的 failover_changed 帧必须逐字透传"
         );
     }
 

@@ -809,6 +809,43 @@ async fn first_sse_frame(resp: reqwest::Response) -> String {
     }
 }
 
+/// 在**同一条** SSE 流上继续读到指定类型的帧为止（带超时），跳过其他类型。
+///
+/// `first_sse_frame` 只回答「第一帧是什么」；需要「订阅一次、按顺序断言两帧」
+/// 时用它：`buf` 由调用方持有，未消费完的半个帧不会丢。
+async fn next_frame_of_type<S>(stream: &mut S, buf: &mut String, want_type: &str) -> String
+where
+    S: futures::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
+{
+    use futures::StreamExt;
+
+    let read = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(frame) = take_sse_frame(buf) {
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&frame) else {
+                    continue;
+                };
+                if parsed.get("type").and_then(|t| t.as_str()) == Some(want_type) {
+                    return Some(frame);
+                }
+            }
+            if buf.len() > 65536 {
+                break;
+            }
+        }
+        None
+    })
+    .await;
+
+    match read {
+        Ok(Some(frame)) => frame,
+        Ok(None) => panic!("SSE 流在 10s 内没有产出 {want_type} 帧（缓冲残留 {buf:?}）"),
+        Err(_) => panic!("SSE 流在 10s 内没有产出 {want_type} 帧（超时）"),
+    }
+}
+
 /// 递归找出临时目录下的某个文件名，返回其权限位。
 fn find_file_mode(dir: &std::path::Path, file_name: &str) -> Option<u32> {
     let entries = std::fs::read_dir(dir).ok()?;
@@ -4542,6 +4579,234 @@ async fn remote_reorder_broadcasts_sse_frame() {
         parsed.get("degraded").is_none(),
         "已鉴权连接不得被标成降级：{parsed}"
     );
+
+    teardown(h).await;
+}
+
+/// `POST /api/proxy/failover` 开启与关闭都必须各广播一帧 `failover_changed`。
+///
+/// 关闭那条分支以前**完全不发事件**：数据库改成功、日志也打了，只是没人通知
+/// 前端，UI 就停在旧的目标列表上（切走再回来才刷新）。所以这里从生产入口进：
+/// 真会话 cookie 订阅一条 SSE → REST 开 → 断言 `enabled:true` → REST 关 →
+/// 断言 `enabled:false`，两帧都来自同一条订阅。
+#[serial_test::serial]
+#[tokio::test]
+async fn remote_failover_toggle_broadcasts_changed_frame() {
+    use super::auth::SESSION_COOKIE_NAME;
+
+    let h = start_headless(RecordingSink::new()).await;
+    let session_value = paired_session_cookie(&h).await;
+
+    // 开关会落定模式状态（可能写客户端文件）：绝不能拿真实的 `~/.claude` 开刀。
+    let _home = TestHomeGuard::new();
+
+    // 开启路径要把队列 P1 切过去：队列里必须有一家真实存在的供应商，且应用
+    // 必须在路由模式（否则 `switch_route_for_failover` 直接报错返回，走不到
+    // 广播那一行）。`attached=false` 时只落状态、不重写客户端文件。
+    let provider_id = seed_headless_provider();
+    super::handlers::headless_app_state()
+        .db
+        .add_to_failover_queue("claude", &provider_id)
+        .expect("种故障转移队列");
+    crate::mode::state::update(&crate::live::engine::DeviceStore::for_device(), |state| {
+        state.apps.entry("claude".to_string()).or_default().mode =
+            Some(crate::mode::state::Mode::Proxy);
+    })
+    .expect("落定代理模式状态");
+
+    let sse = reqwest::Client::new()
+        .get(h.url("/api/events"))
+        .header(
+            axum::http::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={session_value}"),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET /api/events 必须打到真实 listener：{e}"));
+    assert_eq!(
+        sse.status().as_u16(),
+        200,
+        "带会话 cookie 打 /api/events 必须 200"
+    );
+    let mut stream = Box::pin(sse.bytes_stream());
+    let mut buf = String::new();
+
+    let toggle = |enabled: bool| {
+        let enabled = enabled;
+        let url = h.url("/api/proxy/failover");
+        let cookie = format!("{SESSION_COOKIE_NAME}={session_value}");
+        async move {
+            // headless 下 handler 末尾的托盘刷新会 panic（没有 AppHandle），响应
+            // 可能在广播之后断开 —— 帧已经在路上，所以不把响应当判据。
+            let _ = reqwest::Client::new()
+                .post(url)
+                .header(axum::http::header::COOKIE, cookie)
+                .json(&serde_json::json!({ "appType": "claude", "enabled": enabled }))
+                .send()
+                .await;
+        }
+    };
+
+    // --- 开：必须收到 enabled:true ---
+    toggle(true).await;
+    let frame_on = next_frame_of_type(&mut stream, &mut buf, "failover_changed").await;
+    let parsed_on: serde_json::Value = serde_json::from_str(&frame_on)
+        .unwrap_or_else(|e| panic!("SSE 帧必须是合法 JSON（{frame_on:?}）：{e}"));
+    assert_eq!(
+        parsed_on["type"], "failover_changed",
+        "开启故障转移必须广播 failover_changed：{parsed_on}"
+    );
+    assert_eq!(
+        parsed_on["app_type"], "claude",
+        "帧里必须标明 app_type，前端据此决定失效哪个应用的缓存：{parsed_on}"
+    );
+    assert_eq!(
+        parsed_on["enabled"], true,
+        "开启后的帧必须带 enabled:true：{parsed_on}"
+    );
+
+    // --- 关：必须收到 enabled:false（以前这条分支一帧都不发）---
+    toggle(false).await;
+    let frame_off = next_frame_of_type(&mut stream, &mut buf, "failover_changed").await;
+    let parsed_off: serde_json::Value = serde_json::from_str(&frame_off)
+        .unwrap_or_else(|e| panic!("SSE 帧必须是合法 JSON（{frame_off:?}）：{e}"));
+    assert_eq!(
+        parsed_off["enabled"], false,
+        "关闭后的帧必须带 enabled:false：{parsed_off}"
+    );
+    assert!(
+        parsed_off.get("degraded").is_none(),
+        "已鉴权连接不得被标成降级：{parsed_off}"
+    );
+
+    teardown(h).await;
+}
+
+/// 故障转移开启时 `POST /api/switch` 必须被拒，且当前供应商原样不动。
+///
+/// 拒绝发生在任何副作用之前：不广播、不 notify、不刷新托盘。所以这里除了
+/// 断言错误体，还要断言 `/api/current` 前后逐字相同 —— 只看错误体的话，
+/// 「先切了再报错」的实现照样绿。
+#[serial_test::serial]
+#[tokio::test]
+async fn remote_switch_is_rejected_while_failover_enabled() {
+    use super::auth::SESSION_COOKIE_NAME;
+
+    let h = start_headless(RecordingSink::new()).await;
+    let session_value = paired_session_cookie(&h).await;
+    let cookie = format!("{SESSION_COOKIE_NAME}={session_value}");
+    let client = reqwest::Client::new();
+
+    let _home = TestHomeGuard::new();
+
+    // 目标与「当前」必须是两家不同的供应商：否则「current 没变」可能只是
+    // 因为它本来就等于目标，这条断言就没验到任何东西。
+    let target = seed_headless_provider();
+    let current = "e2e-current-provider".to_string();
+    let state = super::handlers::headless_app_state();
+    state
+        .db
+        .save_provider(
+            "claude",
+            &crate::provider::Provider::with_id(
+                current.clone(),
+                "E2E 当前供应商".to_string(),
+                serde_json::json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://e2e.invalid",
+                        "ANTHROPIC_AUTH_TOKEN": "e2e-placeholder-token"
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("种当前供应商");
+    state
+        .db
+        .set_current_provider("claude", &current)
+        .expect("落定当前供应商");
+    // `get_effective_current_provider` 先读**进程内的 settings 缓存**，再回落到
+    // 数据库：同进程里更早的切换用例已经把 claude 的指针设成了别家，只改数据库
+    // 的话 `/api/current` 仍会返回旧值。两处都要落定。
+    //
+    // 收尾时还原成目标供应商而不是「原值」：直接读直连指针会被 `mode::current`
+    // 的源码门禁拦下（生产代码一律经 `provider_for` 并说明用途），而目标供应商
+    // 在同进程的 DB 里始终存在，也正是其它切换用例会留下的值。
+    crate::settings::set_current_provider(
+        &crate::app_config::AppType::Claude,
+        Some(current.as_str()),
+    )
+    .expect("落定 settings 当前供应商");
+    state
+        .db
+        .set_proxy_flags_sync("claude", false, true)
+        .expect("打开故障转移标记");
+
+    let read_current = || {
+        let client = client.clone();
+        let url = h.url("/api/current");
+        let cookie = cookie.clone();
+        async move {
+            client
+                .get(url)
+                .header(axum::http::header::COOKIE, cookie)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("GET /api/current 必须打到真实 listener：{e}"))
+                .json::<serde_json::Value>()
+                .await
+                .expect("GET /api/current 必须返回 JSON")
+        }
+    };
+
+    let before = read_current().await;
+    assert_eq!(
+        before["current"]["id"],
+        current.as_str(),
+        "前置：当前供应商必须是我们种下的那家，实际 {before}"
+    );
+
+    let resp = client
+        .post(h.url("/api/switch"))
+        .header(axum::http::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "provider_id": target }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST /api/switch 必须打到真实 listener：{e}"));
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+    assert_eq!(
+        status, 200,
+        "拒绝必须是一个可解析的 200 错误体（与其它「业务失败」同形），实际 {status}，body {body}"
+    );
+    assert_eq!(
+        body["success"], false,
+        "故障转移开启时手动切换必须被拒，实际 {body}"
+    );
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("故障转移"),
+        "错误文案必须说明原因（含「故障转移」），实际 {body}"
+    );
+
+    let after = read_current().await;
+    assert_eq!(
+        after, before,
+        "被拒的切换不得产生任何副作用：当前供应商必须逐字不变"
+    );
+
+    // headless 的 AppState 是进程级单例，别把「故障转移开着」留给后面的用例：
+    // 那会让同进程里下一次 `/api/switch`（比如主链路第 7 步）被同一条守卫拒掉。
+    state
+        .db
+        .set_proxy_flags_sync("claude", false, false)
+        .expect("复位故障转移标记");
+    crate::settings::set_current_provider(
+        &crate::app_config::AppType::Claude,
+        Some(target.as_str()),
+    )
+    .expect("还原 settings 当前供应商");
 
     teardown(h).await;
 }

@@ -42,8 +42,32 @@ export function useProxyEventStream() {
             break;
           case "takeover_changed":
           case "live_configs_changed":
-          case "switch":
           case "shutdown":
+            queryClient.invalidateQueries({
+              queryKey: proxyKeys.takeoverStatus,
+            });
+            break;
+          case "switch":
+            // 切换同时改「当前供应商」和队列里的相对位置（P1/P2 徽章）：
+            // 只失效 takeoverStatus 时列表与队列会一直停在旧值。
+            queryClient.invalidateQueries({ queryKey: ["providers"] });
+            queryClient.invalidateQueries({ queryKey: ["failoverQueue"] });
+            queryClient.invalidateQueries({
+              queryKey: ["autoFailoverEnabled"],
+            });
+            queryClient.invalidateQueries({
+              queryKey: proxyKeys.takeoverStatus,
+            });
+            break;
+          case "failover_changed":
+            // 这个开关决定 UI 上「路由目标按队列还是按手动」。不失效的话，
+            // 开关状态与目标列表会一直显示旧值（切走再回来才刷新）。
+            queryClient.invalidateQueries({
+              queryKey: ["autoFailoverEnabled"],
+            });
+            queryClient.invalidateQueries({ queryKey: ["failoverQueue"] });
+            queryClient.invalidateQueries({ queryKey: ["providers"] });
+            queryClient.invalidateQueries({ queryKey: proxyKeys.status });
             queryClient.invalidateQueries({
               queryKey: proxyKeys.takeoverStatus,
             });

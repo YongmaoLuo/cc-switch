@@ -150,6 +150,16 @@ fn switch_provider_internal(
     app_type: AppType,
     id: &str,
 ) -> Result<SwitchResult, AppError> {
+    // 故障转移开启时供应商由队列推进，手动切换会把队列的 P1 顶掉 —— 语义上
+    // 「能不能手动 switch」只看 auto_failover_enabled，与直连 / 路由模式无关。
+    let (_, auto_failover) = state.db.get_proxy_flags_sync(app_type.as_str());
+    if auto_failover {
+        return Err(AppError::localized(
+            "switch.blocked_by_failover",
+            "故障转移已开启，无法手动切换供应商；请先关闭故障转移",
+            "Cannot switch providers while automatic failover is enabled. Disable failover first.",
+        ));
+    }
     ProviderService::switch(state, app_type, id)
 }
 

@@ -99,4 +99,37 @@ describe("useProxyEventStream", () => {
     ).not.toThrow();
     expect(invalidate).not.toHaveBeenCalled();
   });
+
+  it("switch 帧失效供应商、队列、开关与接管状态四份缓存", () => {
+    const { invalidate } = setup();
+    const es = MockEventSource.instances[0]!;
+
+    emit(es, { type: "switch", degraded: true });
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["providers"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["failoverQueue"] });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["autoFailoverEnabled"],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["proxy", "takeoverStatus"],
+    });
+  });
+
+  it("failover_changed 帧失效开关、队列、供应商与代理状态五份缓存", () => {
+    const { invalidate } = setup();
+    const es = MockEventSource.instances[0]!;
+
+    emit(es, { type: "failover_changed", enabled: true });
+
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["autoFailoverEnabled"],
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["failoverQueue"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["providers"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["proxy", "status"] });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["proxy", "takeoverStatus"],
+    });
+  });
 });

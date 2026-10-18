@@ -409,6 +409,14 @@ function App() {
           async (event: ProviderSwitchEvent) => {
             if (event.appType === activeApp) {
               await refetch();
+              // 切换（含故障转移开启时自动切到 P1）同时动了当前供应商与队列，
+              // 不失效这两份缓存时 P1/P2 徽章与开关状态会停在旧值。
+              await queryClient.invalidateQueries({
+                queryKey: ["failoverQueue"],
+              });
+              await queryClient.invalidateQueries({
+                queryKey: ["autoFailoverEnabled", event.appType],
+              });
             }
             if (event.appType === "pi") {
               await invalidatePiProviderCaches(queryClient);
