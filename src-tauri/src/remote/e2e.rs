@@ -4466,6 +4466,86 @@ async fn loopback_sse_with_session_cookie_receives_full_frames() {
     teardown(h).await;
 }
 
+/// 远程 REST `POST /api/reorder` 必须真的广播一帧 `reorder`。
+///
+/// 这条链路失效时是**静默**的：数据库改成功、日志也打了，只是没人通知前端，
+/// UI 就永远停在旧顺序上 —— 单测若不从生产入口进（手写一帧塞进 `sse_tx`），
+/// handler 忘了 `send` 也照样绿。所以这里是：真会话 cookie 订阅 `/api/events`
+/// → 对真实 provider 调 `/api/reorder` → 断言第一帧就是这次请求对应的帧
+/// （`moved_id` 只可能来自请求体）。
+#[serial_test::serial]
+#[tokio::test]
+async fn remote_reorder_broadcasts_sse_frame() {
+    use super::auth::SESSION_COOKIE_NAME;
+
+    let h = start_headless(RecordingSink::new()).await;
+    let session_value = paired_session_cookie(&h).await;
+
+    // 订阅先建立、触发后到：反过来会撞上「广播早于订阅」的竞态。
+    let sse = reqwest::Client::new()
+        .get(h.url("/api/events"))
+        .header(
+            axum::http::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={session_value}"),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET /api/events 必须打到真实 listener：{e}"));
+    assert_eq!(
+        sse.status().as_u16(),
+        200,
+        "带会话 cookie 打 /api/events 必须 200"
+    );
+
+    // reorder 要求 moved_id 在库里真实存在；种进 headless 那个进程内 AppState ——
+    // handler 读的正是同一个实例。种到别处去只会让请求以「Provider not found」
+    // 结束，而失败路径不广播，断言就会指向 SSE 而不是「数据没种到」。
+    let moved_id = seed_headless_provider();
+
+    let resp = reqwest::Client::new()
+        .post(h.url("/api/reorder"))
+        .header(
+            axum::http::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={session_value}"),
+        )
+        // 线上契约是 camelCase（`ReorderRequest` 的 `rename_all`，README 亦同）；
+        // 写 snake_case 会被 Json extractor 直接 422，根本走不到广播。
+        .json(&serde_json::json!({ "movedId": moved_id, "beforeId": "" }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST /api/reorder 必须打到真实 listener：{e}"));
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        status, 200,
+        "POST /api/reorder 必须受理（body 是 reorder 帧为何没来的第一线索），实际 {status}，body {body}"
+    );
+
+    let frame = first_sse_frame(sse).await;
+    let parsed: serde_json::Value = serde_json::from_str(&frame)
+        .unwrap_or_else(|e| panic!("SSE 帧必须是合法 JSON（{frame:?}）：{e}"));
+    assert_eq!(
+        parsed["type"], "reorder",
+        "必须收到真实 reorder 事件帧（手写的 sse_tx 消息给不出 moved_id），\
+         实际 {parsed}，请求结果 {body}"
+    );
+    assert_eq!(
+        parsed["moved_id"],
+        moved_id.as_str(),
+        "帧里的 moved_id 必须就是这次请求移动的那个：{parsed}"
+    );
+    assert_eq!(
+        parsed["app_type"], "claude",
+        "帧里必须标明 app_type，前端据此决定失效哪个 appId 的缓存：{parsed}"
+    );
+    assert!(
+        parsed.get("degraded").is_none(),
+        "已鉴权连接不得被标成降级：{parsed}"
+    );
+
+    teardown(h).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

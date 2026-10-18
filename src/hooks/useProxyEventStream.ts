@@ -6,21 +6,28 @@
  * - cc-switch v3.20.1 (#5928) 重构后去掉了 useProxyTakeoverStatus 的轮询以节省 idle GPU
  * - 但远程 API（/api/proxy/control）改状态后，桌面 app 没有通知链路
  * - 后端 sse_tx 在接管状态变更时 broadcast EventSource，前端订阅后 invalidate React Query
+ * - 远程 REST `POST /api/reorder` 改 sort_index 后同样没有任何前端通知，
+ *   `providers`（卡片顺序）与 `failoverQueue`（P1/P2 徽章）两份缓存会一直停在旧顺序
  *
  * 用法：在 App.tsx 顶层挂一次即可
  */
 
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { useSettingsQuery } from "@/lib/query";
 import { proxyKeys } from "@/lib/query/proxy";
 
-const REMOTE_PORT = 4000;
+const DEFAULT_REMOTE_PORT = 4000;
 
 export function useProxyEventStream() {
   const queryClient = useQueryClient();
+  // 端口必须跟用户配置走：写死 4000 时，把远程端口改成别的值的实例永远连不上
+  // 自己的 SSE，表现为「REST 改了但 UI 不动」，和这条广播链本身坏掉长得一样。
+  const { data: settings } = useSettingsQuery();
+  const remotePort = settings?.remotePort ?? DEFAULT_REMOTE_PORT;
 
   useEffect(() => {
-    const es = new EventSource(`http://127.0.0.1:${REMOTE_PORT}/api/events`);
+    const es = new EventSource(`http://127.0.0.1:${remotePort}/api/events`);
 
     es.onmessage = (event) => {
       try {
@@ -41,6 +48,12 @@ export function useProxyEventStream() {
               queryKey: proxyKeys.takeoverStatus,
             });
             break;
+          case "reorder":
+            // 远程 REST /api/reorder 改了 sort_index；providers 决定卡片顺序，
+            // failoverQueue 决定 P1/P2 徽章，两个都必须失效。
+            queryClient.invalidateQueries({ queryKey: ["providers"] });
+            queryClient.invalidateQueries({ queryKey: ["failoverQueue"] });
+            break;
         }
       } catch (_) {
         // ignore malformed events
@@ -48,5 +61,5 @@ export function useProxyEventStream() {
     };
 
     return () => es.close();
-  }, [queryClient]);
+  }, [queryClient, remotePort]);
 }

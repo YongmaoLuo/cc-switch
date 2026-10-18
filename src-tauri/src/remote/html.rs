@@ -488,6 +488,10 @@ function connectSSE() {
                 if (document.hidden) {
                     showToast('Provider updated: ' + data.name, 'info');
                 }
+            } else if (data.type === 'reorder') {
+                // /api/reorder 改的是 sort_index：卡片顺序只存在于列表本身，
+                // 不重新拉一遍的话页面会继续按旧顺序显示。
+                loadProviders();
             } else if (data.type === 'shutdown') {
                 es.close();
                 document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;padding:20px;font-size:18px;color:var(--muted-fg);text-align:center;">Remote server stopped.<br>Please reopen from CC Switch.</div>';

@@ -194,8 +194,21 @@ pub async fn get_providers(AxumState(state): AxumState<Arc<RemoteState>>) -> imp
             let current_id =
                 ProviderService::current(app_state.inner(), REMOTE_APP).unwrap_or_default();
 
-            let provider_list: Vec<serde_json::Value> = providers
-                .iter()
+            // IndexMap 的迭代序是插入序，对「优先级」这一语义毫无意义：Web UI
+            // 若不按 sort_index 排，`POST /api/reorder` 改完顺序后页面看起来没变。
+            // 排序口径与 `reorder_providers` 一致（None 排最后）；sort_index 相同时
+            // 用名字兜底，避免同值时顺序随 IndexMap 的插入序漂移。
+            let mut ordered: Vec<(&String, &crate::provider::Provider)> =
+                providers.iter().collect();
+            ordered.sort_by(|(_, a), (_, b)| match (a.sort_index, b.sort_index) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi).then_with(|| a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            });
+
+            let provider_list: Vec<serde_json::Value> = ordered
+                .into_iter()
                 .map(|(id, p)| {
                     json!({
                         "id": id,
@@ -412,6 +425,23 @@ pub async fn reorder_providers(
                 new_idx,
                 REMOTE_APP.as_str()
             );
+
+            // 数据库已经改了，但桌面端与内嵌 Web UI 都靠 SSE 才知道顺序变了：
+            // 不发这一帧，两边会一直显示旧的 P 序号，且没有任何报错提示它们过期了。
+            let sse_data = json!({
+                "type": "reorder",
+                "app_type": REMOTE_APP.as_str(),
+                "moved_id": &body.moved_id,
+                "position": new_idx,
+            });
+            let _ = state.sse_tx.send(sse_data.to_string());
+            log::info!(
+                "[Remote] Broadcast reorder event: '{}' -> position {} in {}",
+                body.moved_id,
+                new_idx,
+                REMOTE_APP.as_str()
+            );
+
             Json(json!({"success": true})).into_response()
         }
         Err(e) => {
@@ -467,8 +497,11 @@ pub async fn sse_events(
     )
 }
 
-/// 广播帧里「provider 发生了切换」的帧类型名。
-const SWITCH_FRAME_TYPE: &str = "switch";
+/// 广播帧里**携带 provider 细节**、因而必须向匿名调用方降级的帧类型白名单。
+///
+/// `switch` 带 `provider_id` / `name`，`reorder` 带 `moved_id` —— 两者都是供应商
+/// 拓扑，匿名流只保留「发生过这件事」。
+const DEGRADED_FRAME_TYPES: &[&str] = &["switch", "reorder"];
 
 /// 把一帧广播载荷投影成 SSE 事件文本；`None` = 这一帧不下发（**不得**因此断流）。
 ///
@@ -476,9 +509,10 @@ const SWITCH_FRAME_TYPE: &str = "switch";
 /// 「这一帧发给这个档位的调用方时长什么样」。
 ///
 /// - [`SessionAudience::Authenticated`]：逐字透传，一个字节都不动。
-/// - [`SessionAudience::AnonymousLoopback`]：`switch` 帧按**白名单**重建为
-///   `{"type":"switch","degraded":true}` —— 只留类型与降级标记，`provider_id`
-///   / `name` 等一切供应商细节都不得出现；其余帧类型（`shutdown` 等）原样下发。
+/// - [`SessionAudience::AnonymousLoopback`]：命中 [`DEGRADED_FRAME_TYPES`] 的帧
+///   （`switch` / `reorder`）按**白名单**重建为 `{"type":<type>,"degraded":true}`
+///   —— 只留类型与降级标记，`provider_id` / `name` / `moved_id` / `position` 等
+///   一切供应商细节都不得出现；其余帧类型（`shutdown` 等）原样下发。
 ///
 /// 为什么按白名单重建而不是逐个 `remove`：移除清单是**枚举**的，新加一个
 /// `provider_xxx` 字段就会从清单漏出去；白名单是**封闭**的，漏不出去。
@@ -489,11 +523,14 @@ pub fn project_frame(raw: &str, audience: SessionAudience) -> Option<String> {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
                 return None;
             };
-            if value.get("type").and_then(|t| t.as_str()) != Some(SWITCH_FRAME_TYPE) {
+            let Some(frame_type) = value.get("type").and_then(|t| t.as_str()) else {
+                return Some(raw.to_string());
+            };
+            if !DEGRADED_FRAME_TYPES.contains(&frame_type) {
                 return Some(raw.to_string());
             }
             serde_json::to_string(&json!({
-                "type": SWITCH_FRAME_TYPE,
+                "type": frame_type,
                 "degraded": true,
             }))
             .ok()
@@ -1525,6 +1562,56 @@ mod tests {
             project_frame(raw, SessionAudience::AnonymousLoopback),
             Some(raw.to_string()),
             "非 switch 帧不得被降级逻辑波及"
+        );
+    }
+
+    /// 匿名档：`reorder` 帧同样必须被降级。
+    ///
+    /// reorder 帧带 `moved_id`（provider id）。漏掉这一条，同机无凭据调用方就能
+    /// 从「谁被挪了」读到供应商拓扑 —— 那正是 switch 降级要挡住的东西；
+    /// 换个帧类型就能绕过去，等于分级形同虚设。
+    #[test]
+    fn project_frame_strips_reorder_details_for_anonymous() {
+        let raw = r#"{"type":"reorder","app_type":"claude","moved_id":"secret-provider-id","position":2}"#;
+        let projected = project_frame(raw, SessionAudience::AnonymousLoopback)
+            .expect("reorder 帧必须仍被下发 —— 降级不是静默丢帧");
+        let parsed: serde_json::Value = serde_json::from_str(&projected)
+            .unwrap_or_else(|e| panic!("降级帧必须是合法 JSON（{projected:?}）：{e}"));
+
+        assert_eq!(parsed["type"], "reorder", "type 必须保留，前端据此刷新顺序");
+        assert_eq!(
+            parsed["degraded"], true,
+            "降级标记必须显式带上，否则前端无法区分「降级」与「无事件」"
+        );
+        assert!(
+            parsed.get("moved_id").is_none(),
+            "匿名流里不得出现 moved_id（实际 {parsed}）"
+        );
+        assert!(
+            parsed.get("app_type").is_none(),
+            "匿名流里不得出现 app_type（实际 {parsed}）"
+        );
+        assert!(
+            parsed.get("position").is_none(),
+            "匿名流里不得出现 position（实际 {parsed}）"
+        );
+        assert!(
+            !projected.contains("secret-provider-id"),
+            "provider id 连文本都不得残留：{projected}"
+        );
+    }
+
+    /// 已鉴权档：`reorder` 帧同样逐字透传。
+    ///
+    /// 前端需要 `moved_id` / `position` 才能按精确变化刷新；被降级成
+    /// `{"type":"reorder","degraded":true}` 会让已鉴权调用方也丢掉这些字段。
+    #[test]
+    fn project_frame_passes_authenticated_reorder_frames_through_verbatim() {
+        let raw = r#"{"type":"reorder","app_type":"claude","moved_id":"p-1","position":2}"#;
+        assert_eq!(
+            project_frame(raw, SessionAudience::Authenticated),
+            Some(raw.to_string()),
+            "已鉴权连接的 reorder 帧必须逐字透传"
         );
     }
 
