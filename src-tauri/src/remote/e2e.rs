@@ -3494,6 +3494,72 @@ async fn provider_icon_color_cannot_inject_svg_attributes() {
     teardown(h).await;
 }
 
+/// 配对的批准 / 撤销：经过本机代理的请求不是「桌面端自己」那一发。
+///
+/// 单测验的是 `require_local_desktop` 这个纯函数与 handler 直调；这里走**真实
+/// listener 上的真实路由**，因而还多验一件单测验不到的事：`headers: HeaderMap`
+/// 这个 extractor 确实被 axum 装配进了 handler（传空表时下面两条 403 依然成立，
+/// 而这里要求它成立是因为头真的到了）。
+#[serial_test::serial]
+#[tokio::test]
+async fn pairing_approve_and_revoke_reject_proxy_signalled_loopback() {
+    let h = start_headless(RecordingSink::new()).await;
+    let base = h.base_url.clone();
+    let json_ct = (
+        axum::http::header::CONTENT_TYPE.as_str(),
+        "application/json",
+    );
+
+    for path in ["/pairing/approve", "/pairing/revoke"] {
+        let body = if path == "/pairing/approve" {
+            serde_json::json!({ "userCode": "ABCDEF" }).to_string()
+        } else {
+            serde_json::json!({ "clientId": "nobody" }).to_string()
+        };
+        // 对端确实是回环（loopback()），唯一多出来的就是这一个转发头。
+        let (status, response) = post_raw_of(
+            &base,
+            loopback(),
+            path,
+            &[json_ct, ("X-Forwarded-For", "203.0.113.1")],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "{path} + X-Forwarded-For：经本机代理转发来的请求不是桌面端自己，\
+             必须 403。实际响应：\n{response}"
+        );
+        assert!(
+            response.contains("local_desktop_only"),
+            "{path} 的拒绝原因必须是 local_desktop_only，实际响应：\n{response}"
+        );
+    }
+
+    // 正向对照：不带信号头的同一格必须真的走到业务逻辑（不存在的 userCode 走
+    // 状态机的 Denied），否则上面两条 403 可能只是「这个 userCode / clientId
+    // 本来就不存在」。两格都是 403，所以这里比的是**错误码**而不是状态码。
+    let (_bare_status, bare) = post_raw_of(
+        &base,
+        loopback(),
+        "/pairing/approve",
+        &[json_ct],
+        &serde_json::json!({ "userCode": "ABCDEF" }).to_string(),
+    )
+    .await;
+    assert!(
+        bare.contains(r#""error":"denied""#),
+        "不带代理信号头的回环请求必须真的走到状态机（不存在的 userCode -> denied），\
+         而不是被来源判据挡下。实际响应：\n{bare}"
+    );
+    assert!(
+        !bare.contains("local_desktop_only"),
+        "不带代理信号头时不得给出 local_desktop_only，实际响应：\n{bare}"
+    );
+
+    teardown(h).await;
+}
+
 /// 进程级日志收集器：把测试窗口内的 `log!` 记进一个全局缓冲。
 ///
 /// 为什么必须真装一个 logger 而不去读 stdout：断言的对象是「服务端在**请求处理

@@ -14,6 +14,12 @@ mod policy;
 mod secret;
 mod token;
 
+// `middleware` 本身仍是私有的，但 `has_proxy_signal` 必须让配对 handler 取到：
+// 批准 / 撤销同样要识别「本机代理在替别人转发」，而这三个头的名单只有这一份
+// （`LOCAL_PROXY_SIGNALS`）。配对侧自己另列一份，症状是两边悄悄漂移 ——
+// 中间件那一侧收紧时，配对侧仍在裸奔。
+pub(crate) use middleware::has_proxy_signal;
+
 // 装配层（`remote::mod`）挂在每条路由上的鉴权中间件与 scope 类型。
 // `SessionAudience` 一并外露：它由中间件在 Allow 出口注入请求 extension，
 // handler（如 `/api/events`）据此选视图 —— 凭据只在闸门这一处被解释一次。

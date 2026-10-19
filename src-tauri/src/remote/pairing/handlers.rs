@@ -383,9 +383,10 @@ fn revoke_credential(state: &PairingApiState, client_id: &str) -> Result<bool, S
 pub async fn pairing_approve(
     state: State<PairingApiState>,
     peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<PairingApproveBody>,
 ) -> Response {
-    if let Some(denied) = require_local_desktop(peer.as_ref()) {
+    if let Some(denied) = require_local_desktop(peer.as_ref(), &headers) {
         return denied;
     }
     match state.store.approve(
@@ -431,9 +432,10 @@ pub async fn pairing_approve(
 pub async fn pairing_revoke(
     state: State<PairingApiState>,
     peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<PairingRevokeBody>,
 ) -> Response {
-    if let Some(denied) = require_local_desktop(peer.as_ref()) {
+    if let Some(denied) = require_local_desktop(peer.as_ref(), &headers) {
         return denied;
     }
     match revoke_credential(&state, &body.client_id) {
@@ -457,9 +459,20 @@ pub async fn pairing_revoke(
 }
 
 /// 批准 / 撤销只许本机。返回 `Some` 表示已被拒绝。
-fn require_local_desktop(peer: Option<&ConnectInfo<SocketAddr>>) -> Option<Response> {
+///
+/// **只看 `ConnectInfo` 的对端地址是不够的**：本机 HTTP 代理（Clash 之类）转发
+/// 进来的请求，对端地址同样是 `127.0.0.1` —— 那一格一旦只看 peer，任何人只要让
+/// 请求经过本机代理就能从「局域网」变成「本机」，human-in-the-loop 的那一环
+/// 直接失效。因此这里与判定表第三列取同一个判据：**携带任一代理信号头就不是
+/// 桌面端自己发的那一发**。
+fn require_local_desktop(
+    peer: Option<&ConnectInfo<SocketAddr>>,
+    headers: &HeaderMap,
+) -> Option<Response> {
     match peer {
-        Some(ci) if ci.0.ip().is_loopback() => None,
+        Some(ci) if ci.0.ip().is_loopback() && !crate::remote::auth::has_proxy_signal(headers) => {
+            None
+        }
         _ => Some(
             (
                 StatusCode::FORBIDDEN,
@@ -832,6 +845,112 @@ mod tests {
         ))
     }
 
+    fn nonloopback_peer() -> Option<ConnectInfo<SocketAddr>> {
+        Some(ConnectInfo(
+            "203.0.113.7:40000"
+                .parse()
+                .expect("valid non-loopback addr"),
+        ))
+    }
+
+    fn headers_with(signal: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_bytes(signal.as_bytes())
+                .unwrap_or_else(|e| panic!("{signal:?} 必须是合法 header 名: {e}")),
+            axum::http::HeaderValue::from_static("203.0.113.1"),
+        );
+        headers
+    }
+
+    /// 批准 / 撤销的来源判据：回环**且**不带代理信号头才算桌面端自己。
+    ///
+    /// 这一格原本只看 `ConnectInfo`，于是本机 HTTP 代理转发进来的请求
+    /// （对端同样落在 `127.0.0.1`）与桌面端自己发出的那一发完全无法区分 ——
+    /// 任何能让请求经过本机代理的人都能自己批掉配对请求。
+    #[test]
+    fn require_local_desktop_rejects_proxy_signalled_loopback() {
+        // 无信号头的回环：放行（桌面端自己的那一发）。
+        assert!(
+            require_local_desktop(loopback_peer().as_ref(), &HeaderMap::new()).is_none(),
+            "回环且不带任何代理信号头 = 桌面端自己，必须放行"
+        );
+
+        // 三个信号头逐个试：只看其中一个就够，名单与判定表第三列同源。
+        for signal in ["x-forwarded-for", "forwarded", "tailscale-user-login"] {
+            assert!(
+                require_local_desktop(loopback_peer().as_ref(), &headers_with(signal)).is_some(),
+                "回环 + `{signal}` = 请求经过本机代理，不是桌面端自己，必须 403"
+            );
+        }
+
+        // 非回环：与改动前一致，照旧 403。
+        assert!(
+            require_local_desktop(nonloopback_peer().as_ref(), &HeaderMap::new()).is_some(),
+            "非回环来源必须 403"
+        );
+        // 拿不到 ConnectInfo 一律按非本机处理（fail-closed），改动后仍如此。
+        assert!(
+            require_local_desktop(None, &HeaderMap::new()).is_some(),
+            "拿不到 ConnectInfo 必须按非本机拒（fail-closed）"
+        );
+    }
+
+    /// 承重的一条：信号头必须真的**穿过 handler 传到判据里**。
+    ///
+    /// 上面那条验的是纯函数。判据改成收 `&HeaderMap` 之后，最容易出的错是
+    /// handler 忘了把头传进去（或者传了个空表）—— 此时判据永远只看回环，
+    /// 而上面那条纯函数用例照样全绿。所以这里从 `pairing_approve` /
+    /// `pairing_revoke` 的**生产入口**进去，要求真的拿到 403 与
+    /// `local_desktop_only`。
+    #[test]
+    fn pairing_handlers_reject_proxy_signalled_loopback_from_the_entry_point() {
+        let (state, _dir) = api();
+        let forwarded = headers_with("x-forwarded-for");
+
+        let (approve_status, approve_body) = read_body(call(|| {
+            pairing_approve(
+                State(state.clone()),
+                loopback_peer(),
+                forwarded.clone(),
+                Json(PairingApproveBody {
+                    user_code: "ABCDEF".into(),
+                    confirmed_foreign_account: false,
+                }),
+            )
+        }));
+        assert_eq!(approve_status, StatusCode::FORBIDDEN);
+        assert_eq!(approve_body["error"], "local_desktop_only");
+
+        let (revoke_status, revoke_body) = read_body(call(|| {
+            pairing_revoke(
+                State(state.clone()),
+                loopback_peer(),
+                forwarded,
+                Json(PairingRevokeBody {
+                    client_id: "does-not-matter".into(),
+                }),
+            )
+        }));
+        assert_eq!(revoke_status, StatusCode::FORBIDDEN);
+        assert_eq!(revoke_body["error"], "local_desktop_only");
+
+        // 正向对照：不带信号头的同一格必须**不是** `local_desktop_only` ——
+        // 否则上面两条 403 可能只是「这两个 userCode / clientId 本来就不存在」。
+        let (ok_status, ok_body) = read_body(call(|| {
+            pairing_revoke(
+                State(state.clone()),
+                loopback_peer(),
+                HeaderMap::new(),
+                Json(PairingRevokeBody {
+                    client_id: "does-not-matter".into(),
+                }),
+            )
+        }));
+        assert_eq!(ok_status, StatusCode::OK);
+        assert_ne!(ok_body["error"], "local_desktop_only");
+    }
+
     /// 回归：按 clientId 撤销必须**真的把凭据摘出凭据库**。
     ///
     /// 上面那条用例走的是 `store.revoke(明文)` —— 比摘要的两端都是 store 自己
@@ -879,6 +998,7 @@ mod tests {
             pairing_revoke(
                 State(state.clone()),
                 loopback_peer(),
+                HeaderMap::new(),
                 Json(PairingRevokeBody {
                     client_id: client_id.clone(),
                 }),

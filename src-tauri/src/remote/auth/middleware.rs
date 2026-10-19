@@ -304,7 +304,11 @@ fn peer_of(req: &Request<Body>) -> Peer {
 /// 语义承诺，`Forwarded` 与 `X-Forwarded-For` 的语法差异也不影响结论。空值同样
 /// 算在场（与改动前 `contains_key` 的语义逐字一致）：判定表第三列从来只有
 /// 「有 / 没有」两态，没有第三态可表达「有但没填」。
-fn has_proxy_signal(headers: &HeaderMap) -> bool {
+///
+/// `pub(crate)` 的理由：配对的批准 / 撤销也必须识别「本机代理在替别人转发」
+/// （见 `pairing::handlers::require_local_desktop`），而这三个头的名单只有
+/// 这一份。两处各列一份的症状是中间件收紧、配对侧照旧裸奔。
+pub(crate) fn has_proxy_signal(headers: &HeaderMap) -> bool {
     headers
         .keys()
         .any(|name| LOCAL_PROXY_SIGNALS.contains(&name.as_str()))
