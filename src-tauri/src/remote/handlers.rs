@@ -570,6 +570,25 @@ pub struct IconQuery {
     pub color: Option<String>,
 }
 
+/// `color` 查询参数是否是可安全替换进 SVG 的颜色字面量。
+///
+/// 唯一放行的形态是 `#` + 3/4/6/8 位 ASCII 十六进制（CSS 短写、带 alpha 的短写、
+/// 常规写、带 alpha 的常规写）。返回 `Some` 时交回**原串**而不是裁剪后的 `hex`
+/// —— 替换点需要的是带 `#` 的完整写法。
+///
+/// 为什么必须白名单而不是黑名单：替换目标是 `fill="currentColor"` 的属性值，
+/// 一旦取值能带上 `"`，就能闭合属性再写任意新属性（`onload=` 之类），
+/// 而这在 `<img src>` 下也会被当作 SVG 文档执行。十六进制字符集之外的任何取值
+/// （含 `red`、`transparent`、`currentColor` 变体）一律判否。
+fn safe_svg_color(color: &str) -> Option<&str> {
+    let hex = color.strip_prefix('#')?;
+    if matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(color)
+    } else {
+        None
+    }
+}
+
 /// GET /api/provider-icons/:name?color=<hex> — 返回 provider 图标 (SVG)
 /// color 参数：将 SVG 中的 currentColor 替换为指定颜色，使 <img> 标签也能正确着色
 pub async fn get_provider_icon(
@@ -654,10 +673,15 @@ pub async fn get_provider_icon(
         }
     };
 
-    // 用实际颜色替换 currentColor，使 <img> 标签也能正确着色
+    // 用实际颜色替换 currentColor，使 <img> 标签也能正确着色。
+    // 颜色必须先过 [`safe_svg_color`]：query 参数直接拼进 SVG 文本，
+    // `color=red" onload="alert(1)` 这种取值会**闭掉 fill 属性再注入新属性**。
     let svg_content = match &query.color {
         Some(color) if !color.is_empty() && color != "currentColor" => {
-            svg_template.replace("currentColor", color)
+            match safe_svg_color(color) {
+                Some(color) => svg_template.replace("currentColor", color),
+                None => svg_template.to_string(),
+            }
         }
         _ => svg_template.to_string(),
     };
@@ -666,6 +690,15 @@ pub async fn get_provider_icon(
         [
             (header::CONTENT_TYPE, "image/svg+xml"),
             (header::CACHE_CONTROL, "public, max-age=3600"),
+            // SVG 是**可执行文档**而不是图片：内联它就等于交出脚本执行权。
+            // `default-src 'none'` 关掉一切来源，只留 `style-src 'unsafe-inline'`
+            // 给图标内部可能存在的内联样式。
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'",
+            ),
+            // 不加这条时浏览器可能把 SVG 按文本嗅探，或干脆猜成别的类型。
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         svg_content,
     )
@@ -1535,7 +1568,7 @@ pub async fn reject_bind_scope(
 
 #[cfg(test)]
 mod tests {
-    use super::{project_frame, proxy_control, ProxyControlRequest, RemoteState};
+    use super::{project_frame, proxy_control, safe_svg_color, ProxyControlRequest, RemoteState};
     use crate::remote::auth::SessionAudience;
     use axum::body::Body;
     use axum::extract::{FromRequest, State as AxumState};
@@ -1547,6 +1580,29 @@ mod tests {
     /// 一条真实的 provider 切换广播帧（`switch_provider` / `broadcast_provider_switch` 发的同款）。
     const SWITCH_FRAME: &str =
         r#"{"type":"switch","provider_id":"p-secret","name":"Secret Provider"}"#;
+
+    /// `color` 只能是十六进制颜色字面量：白名单两侧都必须钉死。
+    ///
+    /// 接受的一侧是 CSS 的四种十六进制写法（3/4/6/8 位）；拒绝的一侧里，
+    /// `red" onload="alert(1)` 就是这条路由真实的注入形态 —— 它能闭合
+    /// `fill="currentColor"` 再挂上新属性，而 `<img src>` 会照样执行。
+    #[test]
+    fn safe_svg_color_accepts_only_hex_literals() {
+        for accepted in ["#fff", "#ffff", "#ffffff", "#ffffffff"] {
+            assert_eq!(
+                safe_svg_color(accepted),
+                Some(accepted),
+                "{accepted:?} 是合法的十六进制颜色，必须原样放行"
+            );
+        }
+        for rejected in ["red", "#ff", "#fffff", "#ggg", r#"red" onload="alert(1)"#] {
+            assert_eq!(
+                safe_svg_color(rejected),
+                None,
+                "{rejected:?} 不是十六进制颜色字面量，必须判否"
+            );
+        }
+    }
 
     /// 已鉴权连接：帧必须**逐字**透传。
     ///

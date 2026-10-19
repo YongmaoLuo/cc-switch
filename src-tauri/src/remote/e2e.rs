@@ -3412,6 +3412,88 @@ async fn credential_in_query_string_is_rejected() {
     teardown(h).await;
 }
 
+/// `?color=` 不得往 SVG 文本里注入属性；响应必须带上 CSP 与 nosniff。
+///
+/// 这条路由把查询参数**原样**拼进 `fill="currentColor"` 的属性值位置，所以
+/// `red" onload="alert(1)` 这种取值会闭合属性、再挂上一个事件处理器 ——
+/// 而 `<img src=".../api/provider-icons/<name>?color=...">` 照样按 SVG 文档
+/// 执行它。单测 `safe_svg_color` 验的是纯函数，这里验的是它在**真实 listener
+/// 上的真实响应**。
+///
+/// **`claude` 与 `github` 都要打，且 `github` 才是承重的那一发**：
+/// `claude.svg` 把颜色写死成 `fill="#D97757"`、通篇没有 `currentColor`，
+/// 于是对它做注入断言永远绿 —— 守卫拆掉也绿，那不是证据。`github.svg` 确实
+/// 带 `currentColor`，替换点在它身上才真的存在。
+#[serial_test::serial]
+#[tokio::test]
+async fn provider_icon_color_cannot_inject_svg_attributes() {
+    let h = start_headless(RecordingSink::new()).await;
+    let base = h.base_url.clone();
+
+    // 注入串整体 URL 编码后再发：未编码的 `"` 会先把请求行本身拆坏，
+    // 那时读回来的 200 与「handler 认得这个参数」毫无关系。
+    for name in ["claude", "github"] {
+        let (injected_status, injected) = raw_of(
+            &base,
+            loopback(),
+            &format!("/api/provider-icons/{name}?color=red%22%20onload%3D%22alert(1)"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            injected_status, 200,
+            "注入串必须照样 200 —— 被拒的是颜色，不是这条路由：{injected}"
+        );
+        assert!(
+            !injected.contains("onload="),
+            "/api/provider-icons/{name} 的响应里不得出现注入的事件处理器：\
+             `?color=red\" onload=\"alert(1)` 必须原样保留 currentColor，而不是闭掉 \
+             fill 属性再写新属性。实际响应：\n{injected}"
+        );
+    }
+
+    // CSP 与 nosniff 是另一半：即便颜色合法，SVG 也是**可执行文档**，
+    // 这两条头把它按「纯图片」锁死。
+    let head = raw_of(
+        &base,
+        loopback(),
+        "/api/provider-icons/claude?color=red%22%20onload%3D%22alert(1)",
+        &[],
+    )
+    .await
+    .1
+    .split("\r\n\r\n")
+    .next()
+    .unwrap_or_default()
+    .to_lowercase();
+    assert!(
+        head.contains("content-security-policy:")
+            && head.contains("default-src 'none'; style-src 'unsafe-inline'"),
+        "SVG 响应必须带 CSP，实际响应头：\n{head}"
+    );
+    assert!(
+        head.contains("x-content-type-options:") && head.contains("nosniff"),
+        "SVG 响应必须带 nosniff，实际响应头：\n{head}"
+    );
+
+    // 正向对照：合法颜色仍然必须真的替换掉 currentColor。否则上面那几条
+    // 全绿也可能只是「这个参数从来不起作用」。
+    let (ok_status, ok) = raw_of(
+        &base,
+        loopback(),
+        "/api/provider-icons/github?color=%23abcdef",
+        &[],
+    )
+    .await;
+    assert_eq!(ok_status, 200, "合法颜色必须 200，实际响应：\n{ok}");
+    assert!(
+        ok.contains("#abcdef"),
+        "合法十六进制颜色必须真的替换 currentColor（github.svg 确实带这个占位符）：\n{ok}"
+    );
+
+    teardown(h).await;
+}
+
 /// 进程级日志收集器：把测试窗口内的 `log!` 记进一个全局缓冲。
 ///
 /// 为什么必须真装一个 logger 而不去读 stdout：断言的对象是「服务端在**请求处理
