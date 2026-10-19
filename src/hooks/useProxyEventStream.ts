@@ -25,8 +25,14 @@ export function useProxyEventStream() {
   // 自己的 SSE，表现为「REST 改了但 UI 不动」，和这条广播链本身坏掉长得一样。
   const { data: settings } = useSettingsQuery();
   const remotePort = settings?.remotePort ?? DEFAULT_REMOTE_PORT;
+  const remoteEnabled = settings?.remoteEnabled ?? false;
 
   useEffect(() => {
+    // 远程管理关着的时候**不建**这条连接。EventSource 断线后会自己重连，
+    // 哪怕端口上根本没有服务在听，它也会按浏览器默认的退避节奏一直重试 ——
+    // 于是一个从不用远程管理的用户，桌面端常年挂着一条注定失败的重连循环。
+    if (!remoteEnabled) return;
+
     const es = new EventSource(`http://127.0.0.1:${remotePort}/api/events`);
 
     es.onmessage = (event) => {
@@ -85,5 +91,5 @@ export function useProxyEventStream() {
     };
 
     return () => es.close();
-  }, [queryClient, remotePort]);
+  }, [queryClient, remotePort, remoteEnabled]);
 }
