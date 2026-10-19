@@ -150,6 +150,16 @@ fn switch_provider_internal(
     app_type: AppType,
     id: &str,
 ) -> Result<SwitchResult, AppError> {
+    // 故障转移开启时供应商由队列推进，手动切换会把队列的 P1 顶掉 —— 语义上
+    // 「能不能手动 switch」只看 auto_failover_enabled，与直连 / 路由模式无关。
+    let (_, auto_failover) = state.db.get_proxy_flags_sync(app_type.as_str());
+    if auto_failover {
+        return Err(AppError::localized(
+            "switch.blocked_by_failover",
+            "故障转移已开启，无法手动切换供应商；请先关闭故障转移",
+            "Cannot switch providers while automatic failover is enabled. Disable failover first.",
+        ));
+    }
     ProviderService::switch(state, app_type, id)
 }
 
@@ -170,6 +180,7 @@ pub async fn switch_provider(
 ) -> Result<SwitchResult, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let handle = app_handle.clone();
+    let id_for_broadcast = id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = handle
             .try_state::<AppState>()
@@ -178,6 +189,14 @@ pub async fn switch_provider(
     })
     .await
     .map_err(|e| format!("供应商切换任务执行失败: {e}"))??;
+
+    // 广播给远程浏览器（SSE）
+    let app_handle = app_handle.clone();
+    let app_type_str = app.as_str().to_string();
+    tauri::async_runtime::spawn(async move {
+        crate::remote::broadcast_provider_switch(&app_handle, &app_type_str, &id_for_broadcast)
+            .await;
+    });
     Ok(result)
 }
 
@@ -590,7 +609,7 @@ fn resolve_coding_plan_credentials(
     }
 }
 
-async fn query_provider_usage_inner(
+pub async fn query_provider_usage_inner(
     state: &AppState,
     copilot_state: &CopilotAuthState,
     xai_state: &XaiOAuthState,
