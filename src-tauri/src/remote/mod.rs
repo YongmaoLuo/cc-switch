@@ -203,6 +203,35 @@ fn scheme_of(tls: bool) -> &'static str {
     }
 }
 
+/// 非回环档位下，这个 listener **真正绑得上去**的那些本机 IPv4 地址。
+///
+/// 这一份名单同时喂给两个去处：[`allowed_hosts`] 要的是 `{ip}:{port}` 的
+/// authority，[`allowed_origins`] 要的是 `{scheme}://{ip}:{port}`。两者必须同源：
+/// 端口一样、地址一样、来源一样。各写一份循环的后果是「改了 Host 那份忘了
+/// Origin 那份」—— listener 明明绑在这个地址上，浏览器发来的 `Origin` 却匹配不
+/// 到任何一条，请求死在中间件第②层，而两边各自的单测都还是绿的。
+///
+/// 取本机地址时认的是**地址**那一半：`local_ipv4_addresses` 返回
+/// `(网卡名, 地址)`，而网卡名（`en0` / `bridge100` 之类）从来不会出现在
+/// authority 或 origin 里。
+///
+/// 去重：Tailscale 地址常常也在 `local_ipv4_addresses` 的枚举结果里，两条来源
+/// 撞上时只留一条。
+fn reachable_ipv4_addresses() -> Vec<String> {
+    let mut ips: Vec<String> = Vec::new();
+    if let Some(ip) = get_tailscale_ip() {
+        ips.push(ip);
+    }
+    ips.extend(
+        local_ipv4_addresses()
+            .into_iter()
+            .map(|(_iface, addr)| addr.to_string()),
+    );
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
 /// CORS `Access-Control-Allow-Origin` 的白名单。
 ///
 /// **这是装配层唯一的 origin 来源**：[`build_router`] 只经它取
@@ -215,8 +244,10 @@ fn scheme_of(tls: bool) -> &'static str {
 /// 1. **本服务自身**（`self_origin`）：服务自己发出去的页面的 origin。
 /// 2. **内嵌 webview**（[`TAURI_WEBVIEW_ORIGINS`] + [`DEV_SERVER_ORIGIN`]）：
 ///    谁在读响应，不受用户配置影响。
-/// 3. **Tailscale origin**：仅当 [`RemoteConfig::bind_scope`] 比 [`BindScope::Loopback`]
-///    宽 —— 那两个档位下浏览器可以从 Tailscale 地址打开页面。
+/// 3. **对外可达的本机地址**：仅当 [`RemoteConfig::bind_scope`] 比
+///    [`BindScope::Loopback`] 宽 —— 那两个档位下 listener 真的绑在 Tailscale 地址
+///    与本机 LAN IPv4 上，浏览器可以从这些地址打开页面，故逐条放行
+///    （[`reachable_ipv4_addresses`] 一份来源）。
 /// 4. **用户白名单**：仅当 [`CorsMode::ExplicitWhitelist`]，逐条过
 ///    [`config::validate_whitelist`] —— 与 `set_cors` 那道闸门**同一份判据**。
 ///
@@ -242,9 +273,16 @@ pub fn allowed_origins(cfg: &RemoteConfig, tls: bool) -> Vec<axum::http::HeaderV
     }
 
     if cfg.bind_scope != BindScope::Loopback {
-        if let Some(ip) = get_tailscale_ip() {
-            origins.push(format!("{scheme}://{ip}:{}", cfg.port));
-        }
+        // 除了 Tailscale，还要把本机 LAN IPv4 逐条放进来：非回环档位下 listener
+        // 就绑在这些地址上，用户从 `http://192.168.x.x:<port>` 打开页面是**应当**
+        // 能用的正常形态。少放一条的后果不是「多拒绝」，而是浏览器直接卡在 CORS
+        // 预检上、连请求都发不出去 —— 而放行与否本该由凭据闸门决定，不是由
+        // 「这台机器当时有几个网卡」决定。
+        origins.extend(
+            reachable_ipv4_addresses()
+                .into_iter()
+                .map(|ip| format!("{scheme}://{ip}:{}", cfg.port)),
+        );
     }
 
     if cfg.cors_mode == CorsMode::ExplicitWhitelist {
@@ -301,13 +339,13 @@ pub fn allowed_hosts(cfg: &RemoteConfig) -> Vec<String> {
     }
 
     if cfg.bind_scope != BindScope::Loopback {
-        if let Some(ip) = get_tailscale_ip() {
-            hosts.push(format!("{ip}:{port}"));
-        }
-        // 返回值是 `(网卡名, 地址)`，要取的是**地址**那一半。
-        for (_iface, addr) in local_ipv4_addresses() {
-            hosts.push(format!("{addr}:{port}"));
-        }
+        // 与 [`allowed_origins`] 同一份来源（[`reachable_ipv4_addresses`]）——
+        // Host 认、Origin 不认的那个分叉是最难查的一类。
+        hosts.extend(
+            reachable_ipv4_addresses()
+                .into_iter()
+                .map(|ip| format!("{ip}:{port}")),
+        );
     }
 
     if cfg.cors_mode == CorsMode::ExplicitWhitelist {
@@ -1798,6 +1836,81 @@ mod tests {
                 "{iface} 链路本地地址混进了暴露面: {addr}"
             );
             assert!(!addr.is_unspecified(), "{iface} 0.0.0.0 混进了暴露面");
+        }
+    }
+
+    /// 非回环档位下，`allowed_origins` 必须把**每一个**本机 LAN IPv4 都放进来。
+    ///
+    /// 只放 Tailscale 是不够的：绝大多数用户根本没装 Tailscale，于是非回环档位下
+    /// 「从 `http://192.168.x.x:<port>` 打开」这条正常路径被 CORS 挡在门外 ——
+    /// 浏览器连预检都过不去，表现为「开了远程管理但局域网打不开」，而查服务端日志
+    /// 只会看到 403，与「地址没进名单」之间没有任何可见联系。
+    ///
+    /// 正向与反向两侧都要：反向钉住「回环档位不能顺手放行 LAN 地址」—— 那会把
+    /// 「仅本机」这一档的承诺悄悄放宽。
+    #[test]
+    fn non_loopback_bind_scope_allows_every_local_lan_ipv4_origin() {
+        let port = 4000;
+
+        // 本机到底有没有 LAN 地址由环境决定（CI 上未必有 `en0`），这里不假装
+        // 它存在：为空就明说并跳过正向断言，只留反向断言 —— 反向在两种环境下
+        // 都成立，不依赖网卡。
+        let lan_ips: Vec<String> = super::local_ipv4_addresses()
+            .into_iter()
+            .map(|(_iface, addr)| addr.to_string())
+            .collect();
+        if lan_ips.is_empty() {
+            eprintln!(
+                "本机没有非回环 IPv4（getifaddrs 枚举结果全被过滤），\
+                 跳过「每个 LAN IP 的 origin 都在列」这一条；\
+                 下面的回环档位否定断言仍然有效"
+            );
+        }
+
+        // 正向：AllInterfaces 档位下每个 LAN IP 的 origin 都在名单里。
+        let wide = RemoteConfig {
+            port,
+            bind_scope: super::BindScope::AllInterfaces,
+            ..Default::default()
+        };
+        let wide_origins = allowed_origins(&wide, false);
+        for ip in &lan_ips {
+            let expected = format!("http://{ip}:{port}");
+            assert!(
+                wide_origins.contains(&axum::http::HeaderValue::from_str(&expected).unwrap()),
+                "非回环档位下本机 LAN 地址 {expected} 必须进 allowed_origins，\
+                 否则从该地址打开的浏览器请求会被 CORS 挡掉；实际 {:?}",
+                wide_origins
+            );
+        }
+
+        // 反向：Loopback 档位下不得出现任何非回环 IPv4 的 origin。
+        let narrow = RemoteConfig {
+            port,
+            bind_scope: super::BindScope::Loopback,
+            ..Default::default()
+        };
+        let narrow_origins = allowed_origins(&narrow, false);
+        for ip in &lan_ips {
+            let leaked = format!("http://{ip}:{port}");
+            assert!(
+                !narrow_origins.contains(&axum::http::HeaderValue::from_str(&leaked).unwrap()),
+                "回环档位下 {leaked} 不得进 allowed_origins —— \
+                 「仅本机」这一档承诺的就是不把它暴露出去；实际 {:?}",
+                narrow_origins
+            );
+        }
+
+        // 去重是承重的：Tailscale 地址常常也在 `local_ipv4_addresses` 里，
+        // 两份来源撞车时留一条即可（两条一模一样的 origin 不致命，但会让
+        // 「这份名单到底有几个来源」这个问题没法回答）。
+        let mut seen = std::collections::HashSet::new();
+        for origin in &wide_origins {
+            assert!(
+                seen.insert(origin.as_bytes().to_vec()),
+                "allowed_origins 里有重复条目 {:?}，来源没有真正去重",
+                origin
+            );
         }
     }
 
