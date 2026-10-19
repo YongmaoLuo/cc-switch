@@ -1557,8 +1557,11 @@ async fn status_of(base: &str, source: IpAddr, path: &str, headers: &[(&str, &st
 /// 第 9 步要断言「secret 字节不出现在**任何**响应体」，只回状态码的话那条
 /// 断言就没有可读的东西可比 —— 于是会退化成一句没人验证的空话。
 async fn raw_of(base: &str, source: IpAddr, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
-    let addr = addr_of(base);
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: */*\r\n");
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\n{}",
+        default_host_line(base, headers)
+    );
+    request.push_str("Accept: */*\r\n");
     append_headers(&mut request, headers);
     request.push_str("Connection: close\r\n\r\n");
     exchange(base, source, &request).await
@@ -1576,9 +1579,9 @@ async fn post_raw_of(
     headers: &[(&str, &str)],
     body: &str,
 ) -> (u16, String) {
-    let addr = addr_of(base);
     let mut request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: */*\r\nContent-Length: {}\r\n",
+        "POST {path} HTTP/1.1\r\n{}Accept: */*\r\nContent-Length: {}\r\n",
+        default_host_line(base, headers),
         body.len()
     );
     append_headers(&mut request, headers);
@@ -1592,6 +1595,25 @@ fn addr_of(base: &str) -> SocketAddr {
     base.trim_start_matches("http://")
         .parse()
         .unwrap_or_else(|e| panic!("base URL {base} 必须解析成 host:port：{e}"))
+}
+
+/// 夹具默认要写的那行 `Host`，除非调用方自带一条。
+///
+/// 调用方要写 `Host` 时**必须能顶掉**默认那条，不能是排在它后面再补一条：
+/// 两条同名 `Host` 落到服务端，`headers().get(HOST)` 只读得到第一条 —— 也就是
+/// 默认那条正确地址。`Host: evil.com` 那条压根没进到 Host 判定函数里，测出来的
+/// 200 是「第一条 Host 放行了」，不是「Host 校验生效了」。
+///
+/// 所以这里返回空串而不是照样写一行；真正的 `Host` 由调用方经 [`append_headers`]
+/// 逐字附上。名字比大小写不敏感（`host` / `Host` 都是同名头）。
+fn default_host_line(base: &str, headers: &[(&str, &str)]) -> String {
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        return String::new();
+    }
+    format!("Host: {}\r\n", addr_of(base))
 }
 
 /// 逐条原样附在请求行之后。
@@ -1813,6 +1835,67 @@ async fn public_routes_do_not_401_for_missing_credentials() {
     teardown(h).await;
 }
 
+/// 匿名放行之前先核 `Host`：`GET /` 带 `Host: evil.com` 必须 403。
+///
+/// 这是 DNS rebinding 的**服务端**那一半。攻击者让 `evil.com` 解析到
+/// `127.0.0.1`，浏览器于是对 `http://evil.com:4000/` 发请求 —— 同一台机器上的
+/// 跨源请求既不带 `Origin`，对端地址又落在回环上，判定表里「回环 + 无凭据 =
+/// 放行」那一格会把它整个放过去。唯一还在客户端手里的判据就是 `Host`。
+///
+/// 正向对照是承重的：`GET /` 不带任何凭据，本来就该 200（内嵌 Web UI 在配对
+/// 之前就要能打开）。只断 403 的话，「这条路由坏了」也会同样红。
+#[serial_test::serial]
+#[tokio::test]
+async fn anonymous_loopback_access_still_requires_an_allowed_host() {
+    let h = start_headless(RecordingSink::new()).await;
+
+    // 夹具 helper 默认写的 `Host: {addr}` 就是这个 listener 实际绑定的地址，
+    // 必须仍在允许集合里 —— 否则整条 E2E 会集体变成 403。
+    let (ok_status, _) = raw_of(&h.base_url, loopback(), "/", &[]).await;
+    assert_eq!(
+        ok_status, 200,
+        "前置：不带凭据、不带 Origin 的回环 GET / 必须 200（内嵌 Web UI 的形态），         实际 {ok_status}"
+    );
+
+    // 只换 Host，其余逐字不变：同一个回环来源、同一条路由、同一个无凭据形态。
+    let (evil_status, evil) = raw_of(&h.base_url, loopback(), "/", &[("Host", "evil.com")]).await;
+    assert_eq!(
+        evil_status, 403,
+        "Host: evil.com 必须 403 —— DNS rebinding 的服务端那一半。实际响应：\n{evil}"
+    );
+
+    // 后缀 / 包含匹配最容易被骗的形态：主机名以允许的字面量开头，却指向别处。
+    let (suffix_status, suffix) = raw_of(
+        &h.base_url,
+        loopback(),
+        "/",
+        &[("Host", "127.0.0.1.evil.com")],
+    )
+    .await;
+    assert_eq!(
+        suffix_status, 403,
+        "Host: 127.0.0.1.evil.com 必须 403 —— starts_with / contains 都会被它骗过。         实际响应：\n{suffix}"
+    );
+
+    // 端口也要核：同一个主机名、错端口，不是本服务会应答的那个 authority。
+    let (port_status, port_body) = raw_of(
+        &h.base_url,
+        loopback(),
+        "/",
+        &[(
+            "Host",
+            &format!("127.0.0.1:{}", addr_of(&h.base_url).port() + 1),
+        )],
+    )
+    .await;
+    assert_eq!(
+        port_status, 403,
+        "Host 带错端口必须 403 —— 只看主机名的话，任意端口都算数。实际响应：\n{port_body}"
+    );
+
+    teardown(h).await;
+}
+
 // ===========================================================================
 // 四层规则 E2E：12 格穷尽判定表逐格走真实 TCP
 // ===========================================================================
@@ -1842,16 +1925,45 @@ async fn public_routes_do_not_401_for_missing_credentials() {
 /// 200），所以每一格的红都只可能红在鉴权层，不会红在 handler 里。
 const PROBE_PATH: &str = "/api/health";
 
-/// 白名单 Origin —— **本夹具这份 `RemoteConfig` 算出来的那一条**。
+/// 本夹具这一轮真实生效的白名单 Origin —— `http://<实际绑定地址>`。
 ///
-/// 端口是 `0`（端口由内核分配，见 `start_headless_bound`），因此 `self_origin`
-/// 落在 `http://127.0.0.1:0`；中间件的 Origin 名录与 CORS 的 ACAO 都从
-/// `allowed_origins(&cfg, tls)` 算，中间件那份硬编码 host 表已经没有了。
+/// **必须在运行时从 harness 反查，不能抄字面量**：端口由内核分配，而中间件的
+/// Origin 名录按**实际绑定端口**编译（`start_addrs` 先 bind 再装配 router，
+/// 端口 0 时白名单必须写真实端口而不是 `:0`，否则这个 listener 上每个请求的
+/// `Host` 都不在名单里）。抄一份 `127.0.0.1:0` 会在这一改动之后静默漂移成一条
+/// 永远 403 的用例 —— 而 403 也是「Origin 被否」的出口，症状与「白名单失效」
+/// 一模一样。
 ///
-/// 刻意不抄一份「看起来对」的 `127.0.0.1:4000`：那等于把本节要验的「两层同源」
-/// 换成「测试拿自己抄的字面量跟自己对答案」。字面量与夹具配置之间由
-/// `whitelist_origin_matches_the_fixture_config` 钉住。
-const ORIGIN_WHITELISTED: &str = "http://127.0.0.1:0";
+/// 抄出来的字面量与夹具配置之间由 `whitelist_origin_matches_the_fixture_config`
+/// 钉住：那里验的是「`self_origin` 逐字落在 `allowed_origins` 里」这一形状。
+fn harness_self_origin(h: &Harness) -> String {
+    format!("http://{}", addr_of(&h.base_url))
+}
+
+/// 一格要发的 Origin。
+///
+/// `SelfOrigin` 之所以是个枚举而不是一个 `&str`：harness 是 `loopback_cell` /
+/// `remote_cell` 内部才起的，调用点手上没有它，「反查本轮真实白名单」这件事
+/// 只能在那两个函数里做。
+#[derive(Clone, Copy)]
+enum CellOrigin<'a> {
+    /// 不带 Origin 头。
+    Absent,
+    /// 反查本 harness 真实生效的那条白名单 Origin。
+    SelfOrigin,
+    /// 指定字面量（外站 Origin）。
+    Fixed(&'a str),
+}
+
+impl<'a> CellOrigin<'a> {
+    fn resolve(self, h: &Harness) -> Option<String> {
+        match self {
+            Self::Absent => None,
+            Self::SelfOrigin => Some(harness_self_origin(h)),
+            Self::Fixed(o) => Some(o.to_string()),
+        }
+    }
+}
 
 /// 抄出来的白名单 Origin 字面量不得与夹具配置漂移。
 ///
@@ -1860,16 +1972,22 @@ const ORIGIN_WHITELISTED: &str = "http://127.0.0.1:0";
 #[serial_test::serial]
 #[test]
 fn whitelist_origin_matches_the_fixture_config() {
-    let cfg = RemoteConfig {
-        port: 0,
-        ..Default::default()
-    };
-    assert!(
-        allowed_origins(&cfg, REMOTE_LISTENER_IS_TLS)
-            .iter()
-            .any(|o| o == ORIGIN_WHITELISTED),
-        "{ORIGIN_WHITELISTED:?} 必须在本夹具配置的 allowed_origins 里"
-    );
+    // 端口由内核分配，夹具每轮拿到的真值各不相同，因此这里验**形状**而不是某一个
+    // 字面量：`self_origin` 必须逐字落在 `allowed_origins` 里 —— 用例每轮
+    // 发出去的那个 Origin 正是按这条形状从 harness 反查出来的。
+    for port in [0u16, 4000, 51234] {
+        let cfg = RemoteConfig {
+            port,
+            ..Default::default()
+        };
+        let expected = format!("http://127.0.0.1:{port}");
+        assert!(
+            allowed_origins(&cfg, REMOTE_LISTENER_IS_TLS)
+                .iter()
+                .any(|o| o == &expected),
+            "{expected:?} 必须落在端口 {port} 这份配置的 allowed_origins 里"
+        );
+    }
 }
 
 /// 非白名单 Origin：host 里含 `127.0.0.1` 但逐字节不等，前缀匹配与包含匹配都
@@ -2199,18 +2317,19 @@ async fn assert_cell(
     h: &Harness,
     no: u8,
     source: IpAddr,
-    origin: Option<&'static str>,
+    origin: CellOrigin<'_>,
     proxy: bool,
     expect: Expect,
 ) {
+    let origin = origin.resolve(h);
     let mut headers: Vec<(&str, &str)> = Vec::new();
-    if let Some(o) = origin {
-        headers.push(("Origin", o));
+    if let Some(o) = &origin {
+        headers.push(("Origin", o.as_str()));
     }
     if proxy {
         headers.push((PROXY_SIGNAL, "1"));
     }
-    let cell = describe_cell(no, source, origin, proxy);
+    let cell = describe_cell(no, source, origin.as_deref(), proxy);
     let status = status_of(&h.base_url, source, PROBE_PATH, &headers).await;
     match expect {
         // 放行这一侧只断言 2xx：锁的是「闸门没拦住」，不是 handler 的响应体形状
@@ -2238,7 +2357,7 @@ async fn assert_cell(
 ///
 /// 这里的 peer 不是「我们声称它是 loopback」，而是内核给一个连到 loopback
 /// listener 的连接挑的来源地址 —— 也就是 `ConnectInfo` 真正能读到的那个值。
-async fn loopback_cell(no: u8, origin: Option<&'static str>, proxy: bool, expect: Expect) {
+async fn loopback_cell(no: u8, origin: CellOrigin<'_>, proxy: bool, expect: Expect) {
     let h = start_headless(RecordingSink::new()).await;
     assert_cell(&h, no, loopback(), origin, proxy, expect).await;
     teardown(h).await;
@@ -2247,7 +2366,7 @@ async fn loopback_cell(no: u8, origin: Option<&'static str>, proxy: bool, expect
 /// 同上，远端侧：来源地址钉在真实非 loopback 地址上。
 ///
 /// 本机没有可用地址时打印 SKIP 后直接返回 —— 绝不退化成构造的 peer IP。
-async fn remote_cell(no: u8, origin: Option<&'static str>, proxy: bool, expect: Expect) {
+async fn remote_cell(no: u8, origin: CellOrigin<'_>, proxy: bool, expect: Expect) {
     let Some(src) = remote_source_or_skip().await else {
         return;
     };
@@ -2268,7 +2387,7 @@ async fn remote_cell(no: u8, origin: Option<&'static str>, proxy: bool, expect: 
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_01_remote_no_origin_no_proxy_is_401() {
-    remote_cell(1, None, false, Expect::Unauthorized).await;
+    remote_cell(1, CellOrigin::Absent, false, Expect::Unauthorized).await;
 }
 
 /// 第 2 格：远端 + 无 Origin + 有代理信号 → 401。
@@ -2277,7 +2396,7 @@ async fn cell_01_remote_no_origin_no_proxy_is_401() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_02_remote_no_origin_with_proxy_signal_is_401() {
-    remote_cell(2, None, true, Expect::Unauthorized).await;
+    remote_cell(2, CellOrigin::Absent, true, Expect::Unauthorized).await;
 }
 
 /// 第 3 格：远端 + 白名单 Origin + 无代理信号 → 401。
@@ -2286,21 +2405,27 @@ async fn cell_02_remote_no_origin_with_proxy_signal_is_401() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_03_remote_whitelisted_origin_no_proxy_is_401() {
-    remote_cell(3, Some(ORIGIN_WHITELISTED), false, Expect::Unauthorized).await;
+    remote_cell(3, CellOrigin::SelfOrigin, false, Expect::Unauthorized).await;
 }
 
 /// 第 4 格：远端 + 白名单 Origin + 有代理信号 → 401。
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_04_remote_whitelisted_origin_with_proxy_signal_is_401() {
-    remote_cell(4, Some(ORIGIN_WHITELISTED), true, Expect::Unauthorized).await;
+    remote_cell(4, CellOrigin::SelfOrigin, true, Expect::Unauthorized).await;
 }
 
 /// 第 5 格：远端 + 非白名单 Origin + 无代理信号 → 403。
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_05_remote_foreign_origin_is_403() {
-    remote_cell(5, Some(ORIGIN_FOREIGN), false, Expect::ForbiddenOrigin).await;
+    remote_cell(
+        5,
+        CellOrigin::Fixed(ORIGIN_FOREIGN),
+        false,
+        Expect::ForbiddenOrigin,
+    )
+    .await;
 }
 
 /// 第 6 格：远端 + 非白名单 Origin + 有代理信号 → 403。
@@ -2309,7 +2434,13 @@ async fn cell_05_remote_foreign_origin_is_403() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_06_remote_foreign_origin_with_proxy_signal_is_403() {
-    remote_cell(6, Some(ORIGIN_FOREIGN), true, Expect::ForbiddenOrigin).await;
+    remote_cell(
+        6,
+        CellOrigin::Fixed(ORIGIN_FOREIGN),
+        true,
+        Expect::ForbiddenOrigin,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2322,7 +2453,7 @@ async fn cell_06_remote_foreign_origin_with_proxy_signal_is_403() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_07_loopback_no_origin_no_proxy_allows_real_tcp() {
-    loopback_cell(7, None, false, Expect::Allow).await;
+    loopback_cell(7, CellOrigin::Absent, false, Expect::Allow).await;
 }
 
 /// 第 8 格：loopback + 无 Origin + **有**代理信号 → 401。
@@ -2331,7 +2462,7 @@ async fn cell_07_loopback_no_origin_no_proxy_allows_real_tcp() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_08_loopback_no_origin_with_proxy_signal_is_401() {
-    loopback_cell(8, None, true, Expect::Unauthorized).await;
+    loopback_cell(8, CellOrigin::Absent, true, Expect::Unauthorized).await;
 }
 
 /// 第 9 格：loopback + 白名单 Origin + 无代理信号 → 放行（真实 TCP）。
@@ -2340,7 +2471,7 @@ async fn cell_08_loopback_no_origin_with_proxy_signal_is_401() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_09_loopback_whitelisted_origin_no_proxy_allows_real_tcp() {
-    loopback_cell(9, Some(ORIGIN_WHITELISTED), false, Expect::Allow).await;
+    loopback_cell(9, CellOrigin::SelfOrigin, false, Expect::Allow).await;
 }
 
 /// 第 10 格：loopback + 白名单 Origin + 有代理信号 → 401。
@@ -2349,7 +2480,7 @@ async fn cell_09_loopback_whitelisted_origin_no_proxy_allows_real_tcp() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_10_loopback_whitelisted_origin_with_proxy_signal_is_401() {
-    loopback_cell(10, Some(ORIGIN_WHITELISTED), true, Expect::Unauthorized).await;
+    loopback_cell(10, CellOrigin::SelfOrigin, true, Expect::Unauthorized).await;
 }
 
 /// 第 11 格：loopback + 非白名单 Origin → 403。
@@ -2358,14 +2489,26 @@ async fn cell_10_loopback_whitelisted_origin_with_proxy_signal_is_401() {
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_11_loopback_foreign_origin_is_403() {
-    loopback_cell(11, Some(ORIGIN_FOREIGN), false, Expect::ForbiddenOrigin).await;
+    loopback_cell(
+        11,
+        CellOrigin::Fixed(ORIGIN_FOREIGN),
+        false,
+        Expect::ForbiddenOrigin,
+    )
+    .await;
 }
 
 /// 第 12 格：loopback + 非白名单 Origin + 有代理信号 → 403。
 #[serial_test::serial]
 #[tokio::test]
 async fn cell_12_loopback_foreign_origin_with_proxy_signal_is_403() {
-    loopback_cell(12, Some(ORIGIN_FOREIGN), true, Expect::ForbiddenOrigin).await;
+    loopback_cell(
+        12,
+        CellOrigin::Fixed(ORIGIN_FOREIGN),
+        true,
+        Expect::ForbiddenOrigin,
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2413,7 +2556,10 @@ async fn connect_info_is_actually_used() {
         &h.base_url,
         loopback(),
         PROBE_PATH,
-        &[(PROXY_SIGNAL, "1"), ("Origin", ORIGIN_WHITELISTED)],
+        &[
+            (PROXY_SIGNAL, "1"),
+            ("Origin", harness_self_origin(&h).as_str()),
+        ],
     )
     .await;
     assert_eq!(
@@ -3177,13 +3323,14 @@ async fn csrf_cross_site_post_on_all_write_routes_is_403() {
         // 内嵌 Web UI / Tauri webview 会一起打不开。这里只断言「不是 403」，
         // 刻意不钉死具体码 —— 那是 handler 层 extractor 的契约，由
         // `handlers::tests` 的 415 断言负责，两边各管一段。
+        let whitelisted_origin = harness_self_origin(&h);
         let whitelisted =
-            cross_site_post_from_origin(&base, path, form_body, ORIGIN_WHITELISTED).await;
+            cross_site_post_from_origin(&base, path, form_body, &whitelisted_origin).await;
         let status = whitelisted.status().as_u16();
         let body = whitelisted.text().await.unwrap_or_default();
         assert_ne!(
             status, 403,
-            "{path}：白名单 Origin（{ORIGIN_WHITELISTED}）的同形态请求不得被 Origin \
+            "{path}：白名单 Origin（{whitelisted_origin}）的同形态请求不得被 Origin \
              否决挡下 —— 这条闸门挡的是跨站，不是本机内嵌页面。实际 {status}，body {body}"
         );
 
@@ -5611,12 +5758,13 @@ mod tests {
             );
 
             // ── 反向腿：白名单 Origin + 同一份 cookie 不得被 403 ──
+            let whitelisted_origin = harness_self_origin(&h);
             let (whitelisted, body_w) = post_raw_of(
                 &base,
                 src,
                 path,
                 &[
-                    ("Origin", ORIGIN_WHITELISTED),
+                    ("Origin", whitelisted_origin.as_str()),
                     ("Cookie", cookie_header.as_str()),
                 ],
                 form_body,
@@ -5624,7 +5772,7 @@ mod tests {
             .await;
             assert_ne!(
                 whitelisted, 403,
-                "{path}：白名单 Origin（{ORIGIN_WHITELISTED}）+ 同一份会话 cookie 不得被 \
+                "{path}：白名单 Origin（{whitelisted_origin}）+ 同一份会话 cookie 不得被 \
                  Origin 否决挡下 —— 这道闸门挡的是跨站，不是内嵌 Web UI 自己。\
                  实际 {whitelisted}，body {body_w}"
             );

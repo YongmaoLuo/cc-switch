@@ -264,6 +264,84 @@ pub fn allowed_origins(cfg: &RemoteConfig, tls: bool) -> Vec<axum::http::HeaderV
         .collect()
 }
 
+/// 本服务**自己**会用什么 `Host` 被打进来 —— 匿名放行之前的最后一道闸门。
+///
+/// 为什么需要它：`Origin` 头缺失时判定表整条跳过 Origin 否决，而回环来源
+/// 又被无条件豁免凭据闸门，于是「本机页面」那一格对**任何**不带 `Origin` 的
+/// 请求敞开。同一台机器上的恶意网页可以用 `fetch("http://127.0.0.1:4000/…")`
+/// 命中它（跨源 fetch 不带 `Origin` 之外的保证，而这种请求的 `Host` 由浏览器
+/// 按 URL 写成 `127.0.0.1:4000`，恰好落在允许集合里 —— 真正的防线是**攻击者
+/// 换了个域名**的情形：DNS 解析到 127.0.0.1，浏览器写出的 `Host` 就是那个
+/// 域名）。校验 `Host` 之后，DNS rebinding 那条路在服务端就被掐断。
+///
+/// 三类来源，各自独立、互不覆盖：
+///
+/// - **固定回环**：`127.0.0.1` / `localhost` / `[::1]`，带端口与不带端口都收 ——
+///   HTTP/1.0 客户端与某些代理会省略默认端口。
+/// - **非回环绑定时才有的地址**：Tailscale IP 与本机 LAN IPv4，只有
+///   `bind_scope != Loopback` 时才真的绑得上去。
+/// - **显式白名单**：`CorsMode::ExplicitWhitelist` 时用户逐条配过的 origin
+///   的 authority —— 用户既然配了这个 origin 放行它的浏览器请求，Host 就得认。
+///
+/// 去重、trim、丢空串：一份含空串的名单会让「Host 头缺失」这一格通过校验。
+pub fn allowed_hosts(cfg: &RemoteConfig) -> Vec<String> {
+    let port = cfg.port;
+    let mut hosts: Vec<String> = Vec::new();
+
+    for authority in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+        // 不带端口的裸主机名：HTTP/1.0 与默认端口省略的情形。
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "[::1]".to_string(),
+    ] {
+        hosts.push(authority);
+    }
+
+    if cfg.bind_scope != BindScope::Loopback {
+        if let Some(ip) = get_tailscale_ip() {
+            hosts.push(format!("{ip}:{port}"));
+        }
+        // 返回值是 `(网卡名, 地址)`，要取的是**地址**那一半。
+        for (_iface, addr) in local_ipv4_addresses() {
+            hosts.push(format!("{addr}:{port}"));
+        }
+    }
+
+    if cfg.cors_mode == CorsMode::ExplicitWhitelist {
+        for origin in &cfg.origin_whitelist {
+            // 只取 authority：去掉 `http(s)://` 前缀，截到第一个 `/`。
+            // 白名单里的 origin 必须先过 `validate_whitelist`，否则用户存进
+            // 来的畸形串会把这一格变成一个恒真的后缀匹配。
+            if config::validate_whitelist(std::slice::from_ref(origin)).is_err() {
+                continue;
+            }
+            let authority = origin
+                .trim()
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| origin.trim())
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if !authority.is_empty() {
+                hosts.push(authority.to_string());
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    hosts
+        .into_iter()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .filter(|h| seen.insert(h.clone()))
+        .collect()
+}
+
 /// Tauri 运行时句柄，可能缺席（headless）。
 ///
 /// 为什么包一层而不是把字段改成 `Option<AppHandle>`：`handlers.rs` 有 12 处
@@ -583,7 +661,6 @@ impl RemoteState {
         addrs: Vec<SocketAddr>,
         cfg: &RemoteConfig,
     ) -> Vec<String> {
-        let app = build_router(self, cfg);
         let mut started_urls = Vec::new();
         let mut listeners = self.listeners.write().await;
 
@@ -618,6 +695,16 @@ impl RemoteState {
                 // 地址对外报 URL，否则会把 ":0" 泄漏给调用方。
                 let bound = listener.local_addr().unwrap_or(addr);
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+                // **装配必须在 bind 之后**：中间件的 `Host` 白名单是按
+                // `cfg.port` 编译的（见 [`allowed_hosts`]），而端口 0 时真实
+                // 端口只有绑上去才知道。先装 router 再绑，得到的白名单会写着
+                // `:0`，于是这个 listener 上**每一个**请求的 `Host` 都不在名单
+                // 里 —— 生产配置 port 恒非 0，只有 E2E 基座会走到这一支。
+                // 端口非 0 时 `bound_cfg == cfg`，生产路径的行为逐字不变。
+                let mut bound_cfg = cfg.clone();
+                bound_cfg.port = bound.port();
+                let app = build_router(self, &bound_cfg);
 
                 let app_clone = app.clone();
                 let handle = tokio::spawn(async move {

@@ -195,7 +195,52 @@ const SESSION_COOKIE: &str = "cc_switch_session";
 /// 装配读的是同一个 `allowed_origins(&cfg, tls)`。中间件**不持有任何自己写的
 /// origin 名单**：各写一份的故障是静默的（显式白名单模式下 CORS 放行、
 /// 中间件 403，用户的配置看起来保存成功却毫无作用）。
-type AuthState = (AuthScope, PathBuf, OriginSet);
+///
+/// 第四项 [`HostSet`] 同理：它编译自同一个 [`allowed_hosts`]，来源也只有一处。
+type AuthState = (AuthScope, PathBuf, OriginSet, HostSet);
+
+/// 匿名放行之前先核 `Host`：DNS rebinding 的服务端那一半。
+///
+/// 形态与 [`OriginSet`] 同构（编译期算一次、每请求只查表），语义则更严：
+/// **逐条相等**，比较时忽略大小写（`Host` 的主机名部分按 RFC 是不区分大小写的，
+/// 而浏览器可能把 `LOCALHOST` 原样发过来）。任何 `starts_with` / `contains`
+/// 都会被 `127.0.0.1.evil.com` 这类串骗过。
+pub struct HostSet {
+    entries: Vec<String>,
+}
+
+impl Clone for HostSet {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+impl HostSet {
+    /// 按 [`crate::remote::allowed_hosts`] 编译一次。
+    pub fn from_config(cfg: &RemoteConfig) -> Self {
+        Self {
+            entries: crate::remote::allowed_hosts(cfg)
+                .into_iter()
+                .map(|h| h.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    /// 这个 `Host` 是否在本服务会应答的名单内。
+    ///
+    /// 空串一律判否：空 `Host` 头（HTTP/1.0 的极端情形）不是任何一个允许的
+    /// authority，放它过等于给「没有 Host」开一道门。
+    pub fn allows(&self, host: &str) -> bool {
+        let host = host.trim();
+        if host.is_empty() {
+            return false;
+        }
+        let host = host.to_ascii_lowercase();
+        self.entries.iter().any(|entry| entry == &host)
+    }
+}
 
 type AuthLayer = axum::middleware::FromFnLayer<
     fn(State<AuthState>, Request<Body>, Next) -> AuthFuture,
@@ -209,8 +254,8 @@ type AuthLayer = axum::middleware::FromFnLayer<
 /// 临时目录，绝不能因为「进程里恰好能读到 `~/.cc-switch`」就去验用户真实的
 /// 凭据库。配对子系统写的是同一个目录，两端共用一把 secret。
 ///
-/// `cfg` 是暴露边界，**不是**可信输入之外的什么东西：它决定 Origin 名录，
-/// 名录则与 `CorsLayer` 的 `Access-Control-Allow-Origin` 同源。同样的
+/// `cfg` 是暴露边界，**不是**可信输入之外的什么东西：它决定 Origin 与 Host 两份
+/// 名录，两份都与 `CorsLayer` 的 `Access-Control-Allow-Origin` 同源。同样的
 /// `(cfg, tls)` 在两边算一次，编译期求值而不是每请求现算。
 pub fn auth_layer(scope: AuthScope, config_dir: PathBuf, cfg: &RemoteConfig) -> AuthLayer {
     axum::middleware::from_fn_with_state(
@@ -218,19 +263,34 @@ pub fn auth_layer(scope: AuthScope, config_dir: PathBuf, cfg: &RemoteConfig) -> 
             scope,
             config_dir,
             OriginSet::from_config(cfg, REMOTE_LISTENER_IS_TLS),
+            HostSet::from_config(cfg),
         ),
         gate as fn(State<AuthState>, Request<Body>, Next) -> AuthFuture,
     )
 }
 
+/// 请求要用的 `Host`：`Host` 头优先，缺失时回落到 URI 的 authority。
+///
+/// 两处都要查：**HTTP/2 没有 `Host` 头**，权威来源是 `:authority`，axum 把它
+/// 放在 `req.uri()` 里。只认头的话，HTTP/2 客户端会整条绕过 Host 校验；
+/// 只认 URI 的话，HTTP/1.1 的走私写法（URI 里写 `127.0.0.1`、头里写别的）
+/// 反而能从 URI 那一侧蒙混过关。两处取同一个值才是「这个请求声称要访问谁」。
+fn request_host(req: &Request<Body>) -> Option<String> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
+}
+
 /// 中间件本体。
 fn gate(
-    State((scope, config_dir, origins)): State<AuthState>,
+    State((scope, config_dir, origins, hosts)): State<AuthState>,
     mut req: Request<Body>,
     next: Next,
 ) -> AuthFuture {
     Box::pin(async move {
-        let (outcome, credential) = evaluate(scope, &config_dir, &origins, &req);
+        let (outcome, credential) = evaluate(scope, &config_dir, &origins, &hosts, &req);
         match outcome {
             Outcome::Allow(audience) => {
                 // 会话档位随请求往下传：下游 handler 据此选视图，不必重新解析凭据。
@@ -251,7 +311,8 @@ fn gate(
     })
 }
 
-/// 请求的判定结果。与 [`decide`] 同序：Origin 否决 → 通道归类 → 凭据闸门。
+/// 请求的判定结果。与 [`decide`] 同序：Host 否决 → Origin 否决 → 通道归类 →
+/// 凭据闸门。
 ///
 /// 第二个返回值是「这次放行走的是哪条凭据」：只有凭据闸门真的换出摘要才算
 /// 有身份，其余一律 `None`。
@@ -259,8 +320,18 @@ fn evaluate(
     scope: AuthScope,
     config_dir: &Path,
     origins: &OriginSet,
+    hosts: &HostSet,
     req: &Request<Body>,
 ) -> (Outcome, Option<ClientDigest>) {
+    // Host 排在判定表**之前**：判定表里「回环 + 无凭据 = 放行」那一格正是
+    // DNS rebinding 要借的那一格，拿到判定表里面再否决就晚了 —— 它会先把
+    // 本机来源这个身份判出来。Host 不在名单里的请求一律 `ForbiddenOrigin`，
+    // 不给发起方 oracle（与 Origin 被否同一条出口）。
+    let host = request_host(req);
+    if !host.as_deref().is_some_and(|h| hosts.allows(h)) {
+        return (Outcome::ForbiddenOrigin, None);
+    }
+
     // 凭据为零时连文件都不读：本机内嵌页面在配对之前就存在。
     let cred = credential_of(req, scope, config_dir);
     let credential = match cred {
@@ -494,9 +565,24 @@ mod tests {
         strip_comments(src).matches(".route(\"/").count()
     }
 
+    /// 本夹具这份 `RemoteConfig`（`RemoteConfig::default()`）的真实绑定端口。
+    const FIXTURE_PORT: u16 = 4000;
+
+    /// 一个来自 `peer`、发往本机 listener 的请求。
+    ///
+    /// **`Host` 头是必填的**：真实的 HTTP/1.1 请求一定带它，而中间件在判定表
+    /// 之前先核 `Host`（匿名放行前的 DNS rebinding 闸门）。这里不发的话，
+    /// 下面每一条用例都会红在 Host 校验上，红的原因与它们各自要验的那件事
+    /// 无关。值取 `allowed_hosts` 对这份配置给出的那条 `127.0.0.1:<port>`。
     fn request_from(peer: IpAddr, path: &str) -> Request<Body> {
+        request_from_with_host(peer, path, &format!("127.0.0.1:{FIXTURE_PORT}"))
+    }
+
+    /// [`request_from`] 的可换 Host 版本：Host 那一维要单独能摆出坏值。
+    fn request_from_with_host(peer: IpAddr, path: &str, host: &str) -> Request<Body> {
         let mut req = Request::builder()
             .uri(path)
+            .header(header::HOST, host)
             .body(Body::empty())
             .expect("valid request");
         req.extensions_mut()
@@ -610,6 +696,168 @@ mod tests {
             status(public, request_from(lan(), "/")).await,
             StatusCode::OK,
             "Public 路由在无凭据时必须可达，否则配对端点进不来"
+        );
+    }
+
+    /// `HostSet::allows` 的接受 / 拒绝两侧。
+    ///
+    /// 拒绝那一侧的三个形态各自代表一种绕过写法：`evil.com` 是 DNS rebinding
+    /// 的正脸（域名解析到 127.0.0.1，浏览器写出的 `Host` 就是那个域名）；
+    /// `127.0.0.1.evil.com` 骗「后缀/包含」匹配；`127.0.0.1:9999` 骗「只看
+    /// 主机名不看端口」。空串则是「根本没有 Host」——放它过等于给无 Host 的
+    /// 请求开门。
+    #[test]
+    fn host_set_allows_only_the_authorities_this_listener_serves() {
+        let cfg = RemoteConfig {
+            port: 4000,
+            bind_scope: crate::remote::BindScope::AllInterfaces,
+            cors_mode: crate::remote::CorsMode::ExplicitWhitelist,
+            origin_whitelist: vec!["https://team.example".to_string()],
+            ..Default::default()
+        };
+        let hosts = HostSet::from_config(&cfg);
+
+        // `local_ipv4_addresses` 返回的是 `(网卡名, 地址)`，写进 `Host` 头的是
+        // **地址**那一半 —— 网卡名（`bridge100` / `en0` 之类）从来不会作为
+        // authority 出现在请求里。取错那一半，断言就变成在测一个没人会发的值。
+        let lan_authorities: Vec<String> = crate::remote::local_ipv4_addresses()
+            .iter()
+            .map(|(_iface, addr)| format!("{addr}:{}", cfg.port))
+            .collect();
+        if lan_authorities.is_empty() {
+            eprintln!(
+                "本机没有非回环 IPv4（getifaddrs 全被过滤掉了），跳过 LAN authority 那几条断言；\
+                 不拿假地址凑数 —— 那会让一条永远走不到的断言冒充覆盖"
+            );
+        }
+
+        let mut allowed: Vec<String> = vec![
+            "127.0.0.1:4000".to_string(),
+            "localhost:4000".to_string(),
+            "[::1]:4000".to_string(),
+            "team.example".to_string(),
+        ];
+        allowed.extend(lan_authorities);
+
+        for allowed in &allowed {
+            assert!(
+                hosts.allows(allowed),
+                "{allowed:?} 是本服务会应答的 authority，必须放行；实际名单 {:?}",
+                hosts.entries
+            );
+        }
+
+        for rejected in [
+            "evil.com",
+            "127.0.0.1.evil.com",
+            "127.0.0.1:9999",
+            "localhost:9999",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !hosts.allows(rejected),
+                "{rejected:?} 不在本服务会应答的 authority 里，必须判否；实际名单 {:?}",
+                hosts.entries
+            );
+        }
+
+        // 主机名按 RFC 不区分大小写：浏览器完全可能把 `LOCALHOST` 原样发过来。
+        assert!(
+            hosts.allows("LOCALHOST:4000") && hosts.allows("LocalHost:4000"),
+            "Host 的主机名部分必须忽略大小写比较"
+        );
+    }
+
+    /// `Host` 不在名单里 → 403，且这条闸门排在凭据闸门**之前**。
+    ///
+    /// 排在前面是承重的：判定表里「回环 + 无凭据 = 放行」那一格正是 DNS
+    /// rebinding 要借的格子，拿到判定结果之后再否决就晚了。
+    #[tokio::test]
+    async fn foreign_host_is_forbidden_before_the_decision_table() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
+        let app: Router = crate::remote::register(
+            Router::new(),
+            "/api/health",
+            axum::http::Method::GET,
+            AuthScope::Protected,
+            get(ok_handler),
+            dir.path(),
+            &RemoteConfig::default(),
+        )
+        .with_state(());
+
+        // loopback + 无凭据：这一格在判定表里是放行。Host 一换就必须是 403。
+        assert_eq!(
+            status(app.clone(), request_from(loopback(), "/api/health")).await,
+            StatusCode::OK,
+            "前置：同一格带合法 Host 必须放行，否则下面那条 403 只说明「这个夹具谁也过不去」"
+        );
+        assert_eq!(
+            status(
+                app.clone(),
+                request_from_with_host(loopback(), "/api/health", "evil.com")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "回环 + 合法凭据通道 + Host: evil.com 必须 403 —— DNS rebinding 的服务端那一半"
+        );
+        assert_eq!(
+            status(
+                app.clone(),
+                request_from_with_host(lan(), "/api/health", "127.0.0.1:4000")
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "Host 合法但来源是局域网时必须照旧 401 —— Host 闸门不是给凭据闸门减负的"
+        );
+    }
+
+    /// HTTP/2 没有 `Host` 头，权威来源是 `:authority`（axum 放在 URI 里）。
+    ///
+    /// 只认头的话，HTTP/2 客户端会整条绕过 Host 校验 —— 而 h2c 本地客户端
+    /// 并不难写。请求的 URI 写成 `http://evil.com/api/health`、不带 Host 头，
+    /// 必须同样 403。
+    #[tokio::test]
+    async fn authority_in_the_uri_is_checked_when_there_is_no_host_header() {
+        let dir = tempfile::tempdir().expect("isolated config dir");
+        let app: Router = crate::remote::register(
+            Router::new(),
+            "/api/health",
+            axum::http::Method::GET,
+            AuthScope::Protected,
+            get(ok_handler),
+            dir.path(),
+            &RemoteConfig::default(),
+        )
+        .with_state(());
+
+        let mut bad = Request::builder()
+            .uri("http://evil.com/api/health")
+            .body(Body::empty())
+            .expect("valid request");
+        bad.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            40_000,
+        )));
+        assert_eq!(
+            status(app.clone(), bad).await,
+            StatusCode::FORBIDDEN,
+            "没有 Host 头、URI authority 是外站域名时必须 403（HTTP/2 的形态）"
+        );
+
+        let mut good = Request::builder()
+            .uri("http://127.0.0.1:4000/api/health")
+            .body(Body::empty())
+            .expect("valid request");
+        good.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            40_000,
+        )));
+        assert_eq!(
+            status(app, good).await,
+            StatusCode::OK,
+            "URI authority 合法时必须照常放行 —— 否则 HTTP/2 客户端全被误伤"
         );
     }
 
