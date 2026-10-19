@@ -276,11 +276,16 @@ pub async fn switch_provider(
 
     // 故障转移开启时供应商由队列推进，手动切换会把队列的 P1 顶掉。拒绝必须
     // **零副作用**：不广播、不 notify、不刷新托盘 —— 否则 UI 会以为切换发生过。
+    // 判据与命令层共用同一个纯函数：failover 只在路由模式下由队列推进，直连
+    // 模式下即使标志残留也允许手动切换。
     let (_, auto_failover) = app_state
         .inner()
         .db
         .get_proxy_flags_sync(REMOTE_APP.as_str());
-    if auto_failover {
+    if crate::commands::manual_switch_blocked(
+        crate::mode::current::is_proxy(&REMOTE_APP),
+        auto_failover,
+    ) {
         return remote_error(
             axum::http::StatusCode::OK,
             "故障转移已开启，无法手动切换供应商；请先关闭故障转移",

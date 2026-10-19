@@ -4846,11 +4846,15 @@ async fn remote_failover_toggle_broadcasts_changed_frame() {
     teardown(h).await;
 }
 
-/// 故障转移开启时 `POST /api/switch` 必须被拒，且当前供应商原样不动。
+/// **路由模式下**故障转移开启时 `POST /api/switch` 必须被拒，且当前供应商原样不动。
 ///
 /// 拒绝发生在任何副作用之前：不广播、不 notify、不刷新托盘。所以这里除了
 /// 断言错误体，还要断言 `/api/current` 前后逐字相同 —— 只看错误体的话，
 /// 「先切了再报错」的实现照样绿。
+///
+/// 「路由模式」这一格是判据的一半：failover 只在路由模式下由队列推进，直连
+/// 模式下标志位可能残留却不该拦（见
+/// [`remote_switch_is_allowed_in_direct_mode_with_stale_failover_flag`]）。
 #[serial_test::serial]
 #[tokio::test]
 async fn remote_switch_is_rejected_while_failover_enabled() {
@@ -4905,6 +4909,13 @@ async fn remote_switch_is_rejected_while_failover_enabled() {
         .db
         .set_proxy_flags_sync("claude", false, true)
         .expect("打开故障转移标记");
+    // 判据的另一半：必须同时在路由模式下才拦。直连模式下队列压根没在推进，
+    // 按旧判据（只看标志）会把手动切换一并挡死，提示语还写着「故障转移已开启」。
+    crate::mode::state::update(&crate::live::engine::DeviceStore::for_device(), |state| {
+        state.apps.entry("claude".to_string()).or_default().mode =
+            Some(crate::mode::state::Mode::Proxy);
+    })
+    .expect("落定路由模式状态");
 
     let read_current = || {
         let client = client.clone();
@@ -4962,6 +4973,118 @@ async fn remote_switch_is_rejected_while_failover_enabled() {
 
     // headless 的 AppState 是进程级单例，别把「故障转移开着」留给后面的用例：
     // 那会让同进程里下一次 `/api/switch`（比如主链路第 7 步）被同一条守卫拒掉。
+    state
+        .db
+        .set_proxy_flags_sync("claude", false, false)
+        .expect("复位故障转移标记");
+    crate::settings::set_current_provider(
+        &crate::app_config::AppType::Claude,
+        Some(target.as_str()),
+    )
+    .expect("还原 settings 当前供应商");
+    // 模式状态同样是进程级单例（`DeviceStore::for_device()` 指向同一个
+    // `live-state.json`）：必须一起复位，否则同进程里后面那次不带代理模式的
+    // `/api/switch` 会被这条守卫误拒。
+    crate::mode::state::update(&crate::live::engine::DeviceStore::for_device(), |state| {
+        state.apps.entry("claude".to_string()).or_default().mode =
+            Some(crate::mode::state::Mode::Direct);
+    })
+    .expect("复位路由模式状态");
+
+    teardown(h).await;
+}
+
+/// 直连模式下即便 failover 标志残留，`POST /api/switch` 也**不得**被那条守卫拒掉。
+///
+/// 这是本次修复**新增**的那一格，也是旧判据（只看 `auto_failover`）真正错掉的
+/// 地方：用户从路由模式切回直连时标志位不会跟着清，于是手动切换被一条
+/// 「故障转移已开启，无法手动切换」挡住 —— 而直连模式下压根没有队列在推进，
+/// 手动切换不与任何东西冲突。
+///
+/// 前置与 [`remote_switch_is_rejected_while_failover_enabled`] 完全对称：同样
+/// 的凭据、同样的目标/当前两家供应商、同样开着 failover 标志，**只差模式**。
+///
+/// **为什么只断言「守卫没拒」而不是「切换成功」**：这条路由成功之后的托盘
+/// 刷新要 deref `RemoteApp`，headless 下那里必然 panic（`remote/mod.rs` 的
+/// `impl Deref for RemoteApp`），响应根本发不出去 —— 「切换真的落库了」在
+/// 本夹具里无法从 HTTP 侧读到。这里断言的是**这次改动的全部内容**：直连模式
+/// 下守卫不触发。守卫若退化成只看标志，这里立刻拿到那条 403 错误体。
+#[serial_test::serial]
+#[tokio::test]
+async fn remote_switch_is_not_blocked_by_failover_in_direct_mode() {
+    use super::auth::SESSION_COOKIE_NAME;
+
+    let h = start_headless(RecordingSink::new()).await;
+    let session_value = paired_session_cookie(&h).await;
+    let cookie = format!("{SESSION_COOKIE_NAME}={session_value}");
+    let client = reqwest::Client::new();
+
+    let _home = TestHomeGuard::new();
+
+    let target = seed_headless_provider();
+    let current = "e2e-direct-mode-current".to_string();
+    let state = super::handlers::headless_app_state();
+    state
+        .db
+        .save_provider(
+            "claude",
+            &crate::provider::Provider::with_id(
+                current.clone(),
+                "E2E 直连模式当前供应商".to_string(),
+                serde_json::json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://e2e.invalid",
+                        "ANTHROPIC_AUTH_TOKEN": "e2e-placeholder-token"
+                    }
+                }),
+                None,
+            ),
+        )
+        .expect("种当前供应商");
+    state
+        .db
+        .set_current_provider("claude", &current)
+        .expect("落定当前供应商");
+    crate::settings::set_current_provider(
+        &crate::app_config::AppType::Claude,
+        Some(current.as_str()),
+    )
+    .expect("落定 settings 当前供应商");
+
+    // 故障转移标志开着，但模式是**直连** —— 正是「标志残留」那一格。
+    state
+        .db
+        .set_proxy_flags_sync("claude", false, true)
+        .expect("打开故障转移标记");
+    crate::mode::state::update(&crate::live::engine::DeviceStore::for_device(), |state| {
+        state.apps.entry("claude".to_string()).or_default().mode =
+            Some(crate::mode::state::Mode::Direct);
+    })
+    .expect("落定直连模式状态");
+
+    let outcome: Result<(u16, String), String> = match client
+        .post(h.url("/api/switch"))
+        .header(axum::http::header::COOKIE, &cookie)
+        .json(&serde_json::json!({ "provider_id": target }))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            Ok((status, body))
+        }
+        // 连接被掐断 = headless 专有的托盘刷新 panic（见上方注释），不是这条
+        // 守卫的出口，因此也不构成本用例的失败。
+        Err(e) => Err(e.to_string()),
+    };
+    assert!(
+        !matches!(&outcome, Ok((200, body)) if body.contains(r#""success":false"#)),
+        "直连模式下手动切换不得被故障转移守卫拒掉（标志残留也不拦）。\
+         实际结果：{outcome:?}"
+    );
+
+    // 收尾同样复位标志，免得留给同进程后面的用例。
     state
         .db
         .set_proxy_flags_sync("claude", false, false)
