@@ -29,6 +29,16 @@ export function useProxyEventStream() {
   useEffect(() => {
     const es = new EventSource(`http://127.0.0.1:${remotePort}/api/events`);
 
+    // 连上（含断线重连）补一次失效：EventSource 建连之前广播的事件收不到，
+    // 而 status 查询在 running=false 时停止轮询 —— 错过一次就会永久显示
+    // 「路由服务未运行」。onopen 是唯一能覆盖这个窗口的时机：它必然发生在
+    // 远程服务开始监听之后，此时重查就能拿到真实状态。
+    es.onopen = () => {
+      void queryClient.invalidateQueries({ queryKey: proxyKeys.status });
+      void queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus });
+      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+    };
+
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
