@@ -51,23 +51,6 @@ impl ProviderRouter {
                 .ok()
                 .flatten()
         });
-        self.select_providers_with_current(app_type, current_provider)
-            .await
-    }
-
-    /// 同 [`Self::select_providers`]，正在用的那家由调用方给出：处理请求时上下文已经读过
-    /// 一次（要读 `live-state.json` 和这一行），不用每个请求再读一遍，两处用的也一定是
-    /// 同一家。
-    pub async fn select_providers_with_current(
-        &self,
-        app_type: &str,
-        current_provider: Option<Provider>,
-    ) -> Result<Vec<Provider>, AppError> {
-        let mut result = Vec::new();
-        let mut total_providers = 0usize;
-        let mut circuit_open_count = 0usize;
-
-        // 检查该应用的自动故障转移开关是否开启（从 proxy_config 表读取）
         let auto_failover_enabled = match self.db.get_proxy_config_for_app(app_type).await {
             Ok(config) => config.auto_failover_enabled,
             Err(e) => {
@@ -75,6 +58,22 @@ impl ProviderRouter {
                 false
             }
         };
+        self.select_providers_with_current(app_type, current_provider, auto_failover_enabled)
+            .await
+    }
+
+    /// 同 [`Self::select_providers`]，正在用的那家由调用方给出：处理请求时上下文已经读过
+    /// 一次（要读 `live-state.json` 和这一行），不用每个请求再读一遍，两处用的也一定是
+    /// 同一家。故障转移开关也沿用本次请求已读取的配置。
+    pub async fn select_providers_with_current(
+        &self,
+        app_type: &str,
+        current_provider: Option<Provider>,
+        auto_failover_enabled: bool,
+    ) -> Result<Vec<Provider>, AppError> {
+        let mut result = Vec::new();
+        let mut total_providers = 0usize;
+        let mut circuit_open_count = 0usize;
 
         if auto_failover_enabled
             && current_provider
@@ -88,20 +87,8 @@ impl ProviderRouter {
             result.push(current_provider.expect("checked above"));
         } else if auto_failover_enabled {
             // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
-            let all_providers = self.db.get_all_providers(app_type)?;
-
             // 使用 DAO 返回的排序结果，确保和前端展示一致
-            let ordered_ids: Vec<String> = self
-                .db
-                .get_failover_queue(app_type)?
-                .into_iter()
-                .map(|item| item.provider_id)
-                .collect();
-
-            for provider_id in ordered_ids {
-                let Some(provider) = all_providers.get(&provider_id).cloned() else {
-                    continue;
-                };
+            for provider in self.db.get_failover_providers(app_type)? {
                 if !provider_supports_failover(app_type, &provider) {
                     continue;
                 }
@@ -143,8 +130,8 @@ impl ProviderRouter {
     /// - Open：超时到达后切到 HalfOpen 并放行一次探测
     /// - HalfOpen：按限流规则放行探测
     ///
-    /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
-    /// 否则会导致该 Provider 长时间无法进入探测状态。
+    /// 占用了 HalfOpen 探测名额时，名额由返回值里的 guard 持有：这次尝试结束（或请求
+    /// 中途被丢弃）guard 一 drop 就归还，调用方要让它活到尝试结束。
     pub async fn allow_provider_request(
         &self,
         provider_id: &str,
@@ -306,7 +293,7 @@ impl ProviderRouter {
             Err(_) => crate::proxy::circuit_breaker::CircuitBreakerConfig::default(),
         };
 
-        let breaker = Arc::new(CircuitBreaker::new(config));
+        let breaker = Arc::new(CircuitBreaker::new(config).with_label(key));
         breakers.insert(key.to_string(), breaker.clone());
 
         breaker
@@ -606,6 +593,59 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_dropping_permit_frees_half_open_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        // 配置熔断器：1 次失败即熔断，0 秒超时立即进入 HalfOpen
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+
+        // 启用自动故障转移
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 触发熔断：1 次失败
+        router
+            .record_result("a", "claude", false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        // 第一次请求：获取 HalfOpen 探测名额
+        let first = router.allow_provider_request("a", "claude").await;
+        assert!(first.allowed);
+        assert!(first.permit.is_some());
+
+        // 第二次请求应被拒绝（名额已被占用）
+        let second = router.allow_provider_request("a", "claude").await;
+        assert!(!second.allowed);
+
+        // 第一次请求结束（或被中途丢弃）：放行结果一 drop 就归还名额
+        drop(first);
+
+        // 第三次请求应被允许（名额已释放）
+        let third = router.allow_provider_request("a", "claude").await;
+        assert!(third.allowed);
+        assert!(third.permit.is_some());
+    }
+
+    /// 整流器等 neutral 场景：把 guard 的所有权移交给 `release_permit_neutral`，
+    /// 由它归还名额（不影响健康统计）。
+    #[tokio::test]
+    #[serial]
     async fn test_release_permit_neutral_frees_half_open_slot() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
@@ -657,5 +697,105 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.permit.is_some());
+    }
+
+    /// 拿着探测名额的请求被中途丢弃（客户端断开取消了 future）也要归还名额，
+    /// 否则这家一直停在 HalfOpen、所有请求都被拒绝，直到重启（#7206 / #9292）。
+    #[tokio::test]
+    #[serial]
+    async fn test_cancelled_probe_returns_half_open_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = Arc::new(ProviderRouter::new(db.clone()));
+        router
+            .record_result("a", "claude", false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        // 探测请求拿到名额后卡在上游，然后整个任务被取消，结果一直没记。
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let probe_router = router.clone();
+        let probe = tokio::spawn(async move {
+            let permit = probe_router.allow_provider_request("a", "claude").await;
+            let _ = acquired_tx.send((permit.allowed, permit.permit.is_some()));
+            std::future::pending::<()>().await;
+            drop(permit);
+        });
+        assert_eq!(acquired_rx.await.unwrap(), (true, true));
+        assert!(!router.allow_provider_request("a", "claude").await.allowed);
+
+        probe.abort();
+        let _ = probe.await;
+
+        let next = router.allow_provider_request("a", "claude").await;
+        assert!(next.allowed);
+        assert!(next.permit.is_some());
+    }
+
+    /// 上一轮探测的放行结果还没 drop 时，不允许开新一轮探测——否则同一时刻会有
+    /// 两个探测请求在飞，max_half_open_requests=1 的限流被打破。
+    ///
+    /// 本地实现用 permit-first check 保证这一点：转换 Open → HalfOpen 之前先确认
+    /// 没有 in-flight probe（counter == 0）；上游用的是"轮次编号"机制（允许开新一轮，
+    /// 但旧 permit 只能作废自己那一轮的名额），两者对同一个不变量的两种实现。
+    #[tokio::test]
+    #[serial]
+    async fn test_stale_probe_permit_does_not_free_next_round_slot() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_result("a", "claude", false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        // A 拿到第一轮的名额，探测失败 → Open（A 的放行结果还没 drop）
+        let a = router.allow_provider_request("a", "claude").await;
+        assert!(a.permit.is_some());
+        router
+            .record_result("a", "claude", false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        // 超时为 0，但 A 的名额还占着：permit-first check 挡住新一轮探测
+        let b = router.allow_provider_request("a", "claude").await;
+        assert!(!b.allowed);
+        assert!(b.permit.is_none());
+
+        // A 这时才 drop：名额归还，新一轮探测可以放行
+        drop(a);
+        let c = router.allow_provider_request("a", "claude").await;
+        assert!(c.allowed);
+        assert!(c.permit.is_some());
     }
 }
