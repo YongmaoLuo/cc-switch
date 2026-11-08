@@ -822,6 +822,15 @@ pub async fn proxy_takeover(
                 body.app_type,
                 body.enabled
             );
+            // 与桌面命令 `commands::proxy::set_proxy_takeover_for_app` 对称：改完接管
+            // 状态必须广播，前端 SSE 订阅后 invalidate，UI 才能立刻同步。远程 API 改
+            // 状态后桌面 UI 不刷新是历史上出过的回归（takeoverStatus 是 poll=false，
+            // 只靠 SSE 通知）。只在成功时发：失败没有被改动的状态，发了只会白刷一次。
+            app_state.proxy_service.broadcast_event(json!({
+                "type": "takeover_changed",
+                "app_type": body.app_type,
+                "enabled": body.enabled,
+            }));
             Json(json!({"success": true})).into_response()
         }
         Err(e) => {

@@ -116,6 +116,18 @@ describe("useProxyEventStream", () => {
     });
   });
 
+  it("takeover_changed 帧失效接管状态与供应商缓存", () => {
+    const { invalidate } = setup();
+    const es = MockEventSource.instances[0]!;
+
+    emit(es, { type: "takeover_changed", app_type: "claude", enabled: true });
+
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["proxy", "takeoverStatus"],
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["providers"] });
+  });
+
   it("failover_changed 帧失效开关、队列、供应商与代理状态五份缓存", () => {
     const { invalidate } = setup();
     const es = MockEventSource.instances[0]!;

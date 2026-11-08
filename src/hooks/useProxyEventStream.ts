@@ -53,9 +53,14 @@ export function useProxyEventStream() {
           case "takeover_changed":
           case "live_configs_changed":
           case "shutdown":
+            // takeover_changed 同时失效供应商缓存：卡片上的「直连/路由」标签走
+            // ["providers", appType, "mode"]，只失效 takeoverStatus 时标签会一直
+            // 停在旧值。live_configs_changed / shutdown 共用同一分支（同样会改
+            // Live 配置与接管状态），保持共用不拆。
             queryClient.invalidateQueries({
               queryKey: proxyKeys.takeoverStatus,
             });
+            queryClient.invalidateQueries({ queryKey: ["providers"] });
             break;
           case "switch":
             // 切换同时改「当前供应商」和队列里的相对位置（P1/P2 徽章）：
