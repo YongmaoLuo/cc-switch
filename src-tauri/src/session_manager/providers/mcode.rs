@@ -12,7 +12,13 @@ pub(crate) fn database_path() -> PathBuf {
 }
 
 pub(crate) fn open_database() -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(database_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    open_database_at(&database_path())
+}
+
+/// 只读打开指定的 runtime-state 库：额外的 MCode 数据目录各有各的库，
+/// 不能都走默认目录。
+pub(crate) fn open_database_at(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
