@@ -8,14 +8,123 @@ use crate::session_manager::providers::mcode;
 use rusqlite::{params, OptionalExtension};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 pub fn sync_mcode_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
-    if !mcode::database_path().exists() {
-        return Ok(SessionSyncResult::default());
+    let extra = extra_mcode_data_dirs_from(&extra_dirs_config_path());
+    let dirs = collect_mcode_data_dirs(crate::mcode_config::data_dir(), &extra);
+    sync_mcode_data_dirs(db, &dirs)
+}
+
+/// 额外数据目录的配置文件位置：放在 CC Switch 自己的目录下，
+/// 测试用 `CC_SWITCH_TEST_HOME` 就能把它和用户数据隔开。
+fn extra_dirs_config_path() -> PathBuf {
+    crate::config::get_home_dir()
+        .join(".cc-switch")
+        .join("usage-extra-dirs.json")
+}
+
+/// 读取配置里额外采集的数据目录。
+///
+/// 配置文件是用户自己写的，坏了只能当"没有额外目录"：一次坏配置不该让整次同步失败。
+fn extra_mcode_data_dirs_from(path: &Path) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            log::warn!(
+                "Cannot read extra usage dirs config {}: {error}",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        log::warn!(
+            "Ignoring malformed extra usage dirs config: {}",
+            path.display()
+        );
+        return Vec::new();
+    };
+    let Some(entries) = value.get("mcode") else {
+        return Vec::new();
+    };
+    let Some(items) = entries.as_array() else {
+        log::warn!(
+            "Ignoring extra usage dirs config with non-list \"mcode\": {}",
+            path.display()
+        );
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for item in items {
+        let Some(dir) = item.as_str() else {
+            log::warn!(
+                "Ignoring extra usage dirs config with non-string entry: {}",
+                path.display()
+            );
+            return Vec::new();
+        };
+        dirs.push(dir.to_string());
     }
-    let source = mcode::open_database()?;
-    let key = format!("mcode:{}", mcode::database_path().display());
-    sync_from_database(db, &source, &key)
+    dirs
+}
+
+/// 默认目录在前，随后是配置里的额外目录（保持配置顺序）。
+///
+/// 同一个目录只留一份：能解析出真实路径就按真实路径比，否则按字面路径比。
+/// 目录还不存在也照样留着，交给同步时再判断。
+pub(crate) fn collect_mcode_data_dirs(default: PathBuf, extra: &[String]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    push_unique_dir(&mut dirs, default);
+    for raw in extra {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        push_unique_dir(&mut dirs, crate::settings::resolve_override_path(raw));
+    }
+    dirs
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let duplicated = dirs
+        .iter()
+        .any(|existing| existing.canonicalize().unwrap_or_else(|_| existing.clone()) == key);
+    if !duplicated {
+        dirs.push(dir);
+    }
+}
+
+/// 逐个数据目录导入用量。单个目录坏了（打不开、结构不对）只跳过它，
+/// 不能让其余目录的用量一起丢掉。
+fn sync_mcode_data_dirs(db: &Database, dirs: &[PathBuf]) -> Result<SessionSyncResult, AppError> {
+    let mut total = SessionSyncResult::default();
+    for dir in dirs {
+        let db_path = dir.join("v2/sqlite/runtime-state.sqlite");
+        if !db_path.exists() {
+            continue;
+        }
+        let source = match mcode::open_database_at(&db_path) {
+            Ok(source) => source,
+            Err(error) => {
+                log::warn!(
+                    "Cannot open MCode usage database {}: {error}",
+                    db_path.display()
+                );
+                continue;
+            }
+        };
+        let key = format!("mcode:{}", db_path.display());
+        match sync_from_database(db, &source, &key) {
+            Ok(result) => total.merge(result),
+            Err(error) => {
+                log::warn!("MCode usage sync failed for {}: {error}", db_path.display());
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn sync_from_database(
@@ -283,6 +392,250 @@ fn non_empty(model: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// 在隔离的 home 下跑测试：配置文件的落点、默认数据目录都由 home 决定。
+    fn with_test_home<T>(test_fn: impl FnOnce(&Path) -> T) -> T {
+        let _guard = test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", tmp.path());
+        // MCode 的数据目录也认这两个环境变量，不清掉的话会跑到真实数据上。
+        let old_minimax = std::env::var_os("MINIMAX_DATA_DIR");
+        let old_mavis = std::env::var_os("MAVIS_DATA_DIR");
+        std::env::remove_var("MINIMAX_DATA_DIR");
+        std::env::remove_var("MAVIS_DATA_DIR");
+        let result = test_fn(tmp.path());
+        match old_mavis {
+            Some(value) => std::env::set_var("MAVIS_DATA_DIR", value),
+            None => std::env::remove_var("MAVIS_DATA_DIR"),
+        }
+        match old_minimax {
+            Some(value) => std::env::set_var("MINIMAX_DATA_DIR", value),
+            None => std::env::remove_var("MINIMAX_DATA_DIR"),
+        }
+        match old_test_home {
+            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+        }
+        result
+    }
+
+    /// 造一个只有用量表的 MCode 库，返回库文件路径。
+    fn write_mcode_db(dir: &Path, rows: &[(i64, &str, &str, i64)]) -> PathBuf {
+        let sqlite_dir = dir.join("v2/sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let path = sqlite_dir.join("runtime-state.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE local_runtime_token_usage (
+            id INTEGER PRIMARY KEY,session_id TEXT,model TEXT,ts INTEGER,input_tokens INTEGER,
+            output_tokens INTEGER,reasoning_tokens INTEGER,cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,cost_usd REAL);",
+        )
+        .unwrap();
+        for (id, session_id, model, ts) in rows {
+            conn.execute(
+                "INSERT INTO local_runtime_token_usage
+                 VALUES (?1,?2,?3,?4,10,20,0,0,0,0.5)",
+                params![id, session_id, model, ts],
+            )
+            .unwrap();
+        }
+        conn.close().unwrap();
+        path
+    }
+
+    fn watermarks(db: &Database) -> Vec<(String, i64)> {
+        let conn = db.conn.lock().unwrap();
+        let mut query = conn
+            .prepare(
+                "SELECT file_path, last_line_offset FROM session_log_sync
+                 WHERE file_path LIKE 'mcode:%' AND file_path NOT LIKE '%#timing'
+                 ORDER BY file_path",
+            )
+            .unwrap();
+        query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn collect_mcode_data_dirs_keeps_default_first_and_drops_duplicates() {
+        let default = PathBuf::from("/tmp/cc-switch-mcode-default");
+        let extra = vec![
+            String::from("/tmp/cc-switch-mcode-default"),
+            String::from("   "),
+            String::from(""),
+            String::from("/tmp/cc-switch-mcode-other"),
+            String::from("/tmp/cc-switch-mcode-other"),
+        ];
+        let dirs = collect_mcode_data_dirs(default.clone(), &extra);
+        assert_eq!(
+            dirs,
+            vec![default, PathBuf::from("/tmp/cc-switch-mcode-other")]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn collect_mcode_data_dirs_expands_home_prefix() {
+        let _guard = test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let dirs = collect_mcode_data_dirs(
+            PathBuf::from("/tmp/cc-switch-mcode-default"),
+            &[String::from("~/mcode-profile")],
+        );
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/cc-switch-mcode-default"),
+                tmp.path().join("mcode-profile"),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_mcode_data_dirs_reads_the_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("usage-extra-dirs.json");
+        std::fs::write(&path, r#"{"mcode":["~/a","b"]}"#).unwrap();
+        assert_eq!(extra_mcode_data_dirs_from(&path), vec!["~/a", "b"]);
+    }
+
+    #[test]
+    fn extra_mcode_data_dirs_ignores_missing_or_broken_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("usage-extra-dirs.json");
+        assert!(extra_mcode_data_dirs_from(&missing).is_empty());
+
+        let broken = tmp.path().join("broken.json");
+        std::fs::write(&broken, "{not json").unwrap();
+        assert!(extra_mcode_data_dirs_from(&broken).is_empty());
+
+        let wrong_type = tmp.path().join("wrong-type.json");
+        std::fs::write(&wrong_type, r#"{"mcode":"/tmp/a"}"#).unwrap();
+        assert!(extra_mcode_data_dirs_from(&wrong_type).is_empty());
+
+        let no_key = tmp.path().join("no-key.json");
+        std::fs::write(&no_key, r#"{"claude":["/tmp/a"]}"#).unwrap();
+        assert!(extra_mcode_data_dirs_from(&no_key).is_empty());
+    }
+
+    #[test]
+    fn mcode_usage_syncs_multiple_databases_with_independent_watermarks() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        let path_a = write_mcode_db(&dir_a, &[(1, "s1", "vendor/model-a", 1000)]);
+        let path_b = write_mcode_db(&dir_b, &[(1, "s2", "vendor/model-b", 2000)]);
+        let db = Database::memory().unwrap();
+
+        let result = sync_mcode_data_dirs(&db, &[dir_a.clone(), dir_b.clone()]).unwrap();
+        assert_eq!(result.imported, 2);
+        assert_eq!(result.files_scanned, 2);
+        assert_eq!(
+            watermarks(&db),
+            vec![
+                (format!("mcode:{}", path_a.display()), 1),
+                (format!("mcode:{}", path_b.display()), 1),
+            ]
+        );
+
+        assert_eq!(
+            sync_mcode_data_dirs(&db, &[dir_a.clone(), dir_b.clone()])
+                .unwrap()
+                .imported,
+            0
+        );
+
+        // 只给 B 加一行：A 的水位不能被 B 的推进，B 也不能把 A 的行重导。
+        let conn = rusqlite::Connection::open(&path_b).unwrap();
+        conn.execute(
+            "INSERT INTO local_runtime_token_usage
+             VALUES (?1,'s2','vendor/model-b',?2,10,20,0,0,0,0.5)",
+            params![2i64, 3000i64],
+        )
+        .unwrap();
+        conn.close().unwrap();
+        assert_eq!(
+            sync_mcode_data_dirs(&db, &[dir_a.clone(), dir_b.clone()])
+                .unwrap()
+                .imported,
+            1
+        );
+        assert_eq!(
+            watermarks(&db),
+            vec![
+                (format!("mcode:{}", path_a.display()), 1),
+                (format!("mcode:{}", path_b.display()), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcode_usage_syncs_extra_database_when_default_is_missing() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_default = tmp.path().join("missing");
+        let extra = tmp.path().join("extra");
+        write_mcode_db(&extra, &[(1, "s1", "vendor/model-a", 1000)]);
+        let db = Database::memory().unwrap();
+
+        let result = sync_mcode_data_dirs(&db, &[missing_default, extra]).unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    /// 走生产入口：配置里的额外目录要被真正读到。
+    #[test]
+    #[serial]
+    fn mcode_usage_reads_extra_dirs_from_the_config_file() {
+        if crate::config::sqlite_unsupported_in_temp_dir() {
+            return;
+        }
+        with_test_home(|home| {
+            let extra = home.join("profiles/acc2/home/.minimax");
+            let path = write_mcode_db(&extra, &[(1, "s1", "vendor/model-a", 1000)]);
+            std::fs::create_dir_all(home.join(".cc-switch")).unwrap();
+            std::fs::write(
+                home.join(".cc-switch").join("usage-extra-dirs.json"),
+                format!(r#"{{"mcode":["{}"]}}"#, extra.display()),
+            )
+            .unwrap();
+
+            let db = Database::memory().unwrap();
+            let result = sync_mcode_usage(&db).unwrap();
+            assert_eq!(result.imported, 1);
+            assert_eq!(
+                watermarks(&db),
+                vec![(format!("mcode:{}", path.display()), 1)]
+            );
+            assert_eq!(sync_mcode_usage(&db).unwrap().imported, 0);
+        });
+    }
+
     #[test]
     fn mcode_usage_preserves_model_namespaces() {
         let source = rusqlite::Connection::open_in_memory().unwrap();
